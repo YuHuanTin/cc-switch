@@ -8,6 +8,7 @@ use super::{
     content_encoding::{decompress_body_with_limit, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
+    http_capture::HttpCapture,
     json_canonical::{canonicalize_value, short_value_hash},
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
@@ -2307,18 +2308,23 @@ impl RequestForwarder {
             crate::redact_url_for_log_with_secrets(&url, &log_secrets)
         };
 
-        // 输出请求信息日志
         let tag = adapter.name();
-        let request_model = filtered_body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<none>");
-        log::info!("[{tag}] >>> 请求目标: {target_for_log} (model={request_model})");
-        log::debug!(
-            "[{tag}] >>> 请求体已准备: bytes={}, hash={} (content omitted)",
-            body_bytes.len(),
-            short_value_hash(Some(&filtered_body))
-        );
+        let capture = if log::log_enabled!(log::Level::Debug) {
+            match HttpCapture::start(method, &url, &ordered_headers, &body_bytes) {
+                Ok(capture) => Some(Arc::new(capture)),
+                Err(error) => {
+                    log::warn!("[HttpCapture] 创建 capture.http 记录失败: {error}");
+                    None
+                }
+            }
+        } else {
+            let request_model = filtered_body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<none>");
+            log::info!("[{tag}] >>> 请求目标: {target_for_log} (model={request_model})");
+            None
+        };
 
         // 确定超时
         let timeout = if self.non_streaming_timeout.is_zero() {
@@ -2343,8 +2349,9 @@ impl RequestForwarder {
             is_copilot,
         );
 
-        // 发送请求
-        let response = if is_socks_proxy || !preserve_exact_header_case {
+        // 发送请求。保留 Result 到 capture 包装完成后再处理，确保网络错误也能
+        // 在 capture.http 中留下带 ID 的不完整记录。
+        let response_result = if is_socks_proxy || !preserve_exact_header_case {
             // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
             // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
             log::debug!(
@@ -2376,29 +2383,46 @@ impl RequestForwarder {
                             "流式响应首包超时: {}s（上游未返回响应头）",
                             header_timeout.as_secs()
                         ))
-                    })?
+                    })
+                    .and_then(|result| result.map_err(map_reqwest_send_error))
             } else {
-                send.await
+                send.await.map_err(map_reqwest_send_error)
             };
-            let reqwest_resp = send_result.map_err(map_reqwest_send_error)?;
-            ProxyResponse::Reqwest(reqwest_resp)
+            send_result.map(ProxyResponse::Reqwest)
         } else {
             // HTTP 代理或直连：走 hyper raw write（保持 header 大小写）
             // 如果有 HTTP 代理，hyper_client 会用 CONNECT 隧道穿过代理
-            let uri: http::Uri = url.parse().map_err(|e| {
-                ProxyError::ForwardFailed(format!("Invalid upstream URL ({target_for_log}): {e}"))
-            })?;
-            super::hyper_client::send_request(
-                uri,
-                &target_for_log,
-                method.clone(),
-                ordered_headers,
-                extensions.clone(),
-                body_bytes,
-                timeout,
-                upstream_proxy_url.as_deref(),
-            )
-            .await?
+            match url.parse::<http::Uri>() {
+                Ok(uri) => {
+                    super::hyper_client::send_request(
+                        uri,
+                        method.clone(),
+                        ordered_headers,
+                        extensions.clone(),
+                        body_bytes,
+                        timeout,
+                        upstream_proxy_url.as_deref(),
+                    )
+                    .await
+                }
+                Err(error) => Err(ProxyError::ForwardFailed(format!(
+                    "Invalid upstream URL ({target_for_log}): {error}"
+                ))),
+            }
+        };
+
+        let response = match response_result {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(capture) = capture.as_ref() {
+                    capture.finish_with_error(&error.to_string());
+                }
+                return Err(error);
+            }
+        };
+        let response = match capture {
+            Some(capture) => ProxyResponse::captured(response, capture),
+            None => response,
         };
 
         // 检查响应状态
@@ -2889,17 +2913,7 @@ fn build_terminal_failure_log(
 
 fn summarize_proxy_error(error: &ProxyError) -> String {
     match error {
-        ProxyError::UpstreamError { status, body } => {
-            let body_summary = body
-                .as_deref()
-                .map(summarize_upstream_body)
-                .filter(|summary| !summary.is_empty());
-
-            match body_summary {
-                Some(summary) => format!("上游 HTTP {status}: {summary}"),
-                None => format!("上游 HTTP {status}"),
-            }
-        }
+        ProxyError::UpstreamError { status, .. } => format!("上游 HTTP {status}"),
         ProxyError::Timeout(message) => {
             format!("请求超时: {}", summarize_text_for_log(message, 180))
         }
@@ -2917,34 +2931,6 @@ fn summarize_proxy_error(error: &ProxyError) -> String {
         }
         _ => summarize_text_for_log(&error.to_string(), 180),
     }
-}
-
-fn summarize_upstream_body(body: &str) -> String {
-    if let Ok(json_body) = serde_json::from_str::<Value>(body) {
-        if let Some(message) = extract_json_error_message(&json_body) {
-            return summarize_text_for_log(&message, 180);
-        }
-
-        if let Ok(compact_json) = serde_json::to_string(&json_body) {
-            return summarize_text_for_log(&compact_json, 180);
-        }
-    }
-
-    summarize_text_for_log(body, 180)
-}
-
-fn extract_json_error_message(body: &Value) -> Option<String> {
-    let candidates = [
-        body.pointer("/error/message"),
-        body.pointer("/message"),
-        body.pointer("/detail"),
-        body.pointer("/error"),
-    ];
-
-    candidates
-        .into_iter()
-        .flatten()
-        .find_map(|value| value.as_str().map(ToString::to_string))
 }
 
 fn split_endpoint_and_query(endpoint: &str) -> (&str, Option<&str>) {
@@ -3907,8 +3893,7 @@ mod tests {
         assert_eq!(code, log_fwd::SINGLE_PROVIDER_FAILED);
         assert!(message.contains("Provider PackyCode-response 请求失败"));
         assert!(message.contains("上游 HTTP 429"));
-        // 上游错误消息保留(截断)，用于诊断失败原因。
-        assert!(message.contains("rate limit exceeded"));
+        assert!(!message.contains("rate limit exceeded"));
         assert!(!message.contains("切换下一个"));
     }
 

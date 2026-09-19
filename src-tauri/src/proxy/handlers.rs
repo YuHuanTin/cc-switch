@@ -1846,7 +1846,7 @@ async fn handle_codex_chat_error_response(
                 lossy.into_owned()
             };
             log::warn!(
-                "[Codex] Chat 错误响应不是合法 JSON，按文本透传: body_bytes={} (content omitted)",
+                "[Codex] Chat 错误响应不是合法 JSON，按文本透传: body_bytes={}",
                 body_bytes.len()
             );
             Value::String(truncated)
@@ -2389,7 +2389,7 @@ fn body_diagnostics_suffix(headers: &axum::http::HeaderMap, body: &str) -> Strin
             .unwrap_or("<none>")
     };
     format!(
-        "(content-type: {}; content-encoding: {}; body-bytes: {}; body-kind: {}; content omitted)",
+        "(content-type: {}; content-encoding: {}; body-bytes: {}; body-kind: {})",
         header_str("content-type"),
         header_str("content-encoding"),
         body.len(),

@@ -1,4 +1,4 @@
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_conn, lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta};
 use indexmap::IndexMap;
@@ -362,27 +362,41 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
         tx.execute(
-            "UPDATE provider_health SET provider_id = ?1 WHERE provider_id = ?2 AND app_type = ?3",
-            params![provider.id, original_id, app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        tx.execute(
             "DELETE FROM providers WHERE id = ?1 AND app_type = ?2",
             params![original_id, app_type],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
+        drop(conn);
+
+        let logs_conn = lock_logs_conn!(self.logs_conn);
+        if let Err(e) = logs_conn.execute(
+            "DELETE FROM provider_health
+             WHERE app_type = ?1 AND provider_id IN (?2, ?3)",
+            params![app_type, original_id, provider.id],
+        ) {
+            log::warn!("清理供应商 {original_id} 更换 ID 后的健康状态失败: {e}");
+        }
         Ok(())
     }
 
     pub fn delete_provider(&self, app_type: &str, id: &str) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
-        conn.execute(
-            "DELETE FROM providers WHERE id = ?1 AND app_type = ?2",
+        {
+            let conn = lock_conn!(self.conn);
+            conn.execute(
+                "DELETE FROM providers WHERE id = ?1 AND app_type = ?2",
+                params![id, app_type],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        let logs_conn = lock_logs_conn!(self.logs_conn);
+        if let Err(e) = logs_conn.execute(
+            "DELETE FROM provider_health WHERE provider_id = ?1 AND app_type = ?2",
             params![id, app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        ) {
+            log::warn!("清理已删除供应商 {id} 的健康状态失败: {e}");
+        }
         Ok(())
     }
 

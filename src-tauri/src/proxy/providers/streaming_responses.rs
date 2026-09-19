@@ -2477,8 +2477,6 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                             .or_else(|| data.get("type").and_then(Value::as_str))
                             .unwrap_or("");
 
-                        log::debug!("[Claude/Responses] <<< SSE event: {event_name}");
-
                         // Ignore every event after a terminal response. In particular,
                         // do not synthesize message_start if a broken gateway emits a
                         // late delta after response.failed/error.
@@ -2551,7 +2549,6 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                                 });
                                 let sse = format!("event: message_start\ndata: {}\n\n",
                                     serde_json::to_string(&event).unwrap_or_default());
-                                log::debug!("[Claude/Responses] >>> Anthropic SSE: message_start");
                                 yield Ok(Bytes::from(sse));
                             }
 
@@ -3940,14 +3937,12 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                                 });
                                 let sse = format!("event: message_delta\ndata: {}\n\n",
                                     serde_json::to_string(&delta_event).unwrap_or_default());
-                                log::debug!("[Claude/Responses] >>> Anthropic SSE: message_delta");
                                 yield Ok(Bytes::from(sse));
 
                                 // Emit message_stop
                                 let stop_event = json!({"type": "message_stop"});
                                 let stop_sse = format!("event: message_stop\ndata: {}\n\n",
                                     serde_json::to_string(&stop_event).unwrap_or_default());
-                                log::debug!("[Claude/Responses] >>> Anthropic SSE: message_stop");
                                 yield Ok(Bytes::from(stop_sse));
                                 terminated = true;
                             }

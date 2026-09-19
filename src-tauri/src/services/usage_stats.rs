@@ -2,7 +2,7 @@
 //!
 //! 提供使用量数据的聚合查询功能
 
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_conn, lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::ModelPricing;
 use crate::services::sql_helpers::{
@@ -258,14 +258,14 @@ fn folded_app_type_sql(column: &str) -> String {
     format!("CASE WHEN {column} = 'claude-desktop' THEN 'claude' ELSE {column} END")
 }
 
-/// SQL 片段：把日志/汇总行 LEFT JOIN 到 providers 表以取得供应商名称。
+/// SQL 片段：把日志/汇总行 LEFT JOIN 到日志库中的供应商目录缓存以取得供应商名称。
 /// `proxy_request_logs` 与 `usage_daily_rollups` 的 (provider_id, app_type)
 /// 形状相同，两者皆可作为 `log_alias`。providers 主键即 (id, app_type)，
 /// 连接至多 1:1，不会放大行数。
 fn providers_join(log_alias: &str, provider_alias: &str) -> String {
     format!(
-        "LEFT JOIN providers {provider_alias} \
-         ON {log_alias}.provider_id = {provider_alias}.id \
+        "LEFT JOIN provider_catalog_cache {provider_alias} \
+         ON {log_alias}.provider_id = {provider_alias}.provider_id \
          AND {log_alias}.app_type = {provider_alias}.app_type"
     )
 }
@@ -607,7 +607,8 @@ impl Database {
         provider_name: Option<&str>,
         model: Option<&str>,
     ) -> Result<UsageSummary, AppError> {
-        let conn = lock_conn!(self.conn);
+        self.refresh_provider_catalog_cache()?;
+        let conn = lock_logs_conn!(self.logs_conn);
 
         // Build detail WHERE clause
         let mut conditions = vec![effective_usage_log_filter("l")];
@@ -767,7 +768,8 @@ impl Database {
         provider_name: Option<&str>,
         model: Option<&str>,
     ) -> Result<Vec<UsageSummaryByApp>, AppError> {
-        let conn = lock_conn!(self.conn);
+        self.refresh_provider_catalog_cache()?;
+        let conn = lock_logs_conn!(self.logs_conn);
 
         let mut detail_conditions = vec![effective_usage_log_filter("l")];
         let mut detail_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -931,7 +933,8 @@ impl Database {
         provider_name: Option<&str>,
         model: Option<&str>,
     ) -> Result<Vec<DailyStats>, AppError> {
-        let conn = lock_conn!(self.conn);
+        self.refresh_provider_catalog_cache()?;
+        let conn = lock_logs_conn!(self.logs_conn);
 
         let end_ts = end_date.unwrap_or_else(|| Local::now().timestamp());
         let mut start_ts = start_date.unwrap_or_else(|| end_ts - 24 * 60 * 60);
@@ -1271,7 +1274,8 @@ impl Database {
         provider_name: Option<&str>,
         model: Option<&str>,
     ) -> Result<Vec<ProviderStats>, AppError> {
-        let conn = lock_conn!(self.conn);
+        self.refresh_provider_catalog_cache()?;
+        let conn = lock_logs_conn!(self.logs_conn);
 
         let mut detail_conditions = vec![effective_usage_log_filter("l")];
         let mut detail_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1352,7 +1356,7 @@ impl Database {
                     COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count,
                     COALESCE(SUM(l.latency_ms), 0) as latency_sum
                 FROM proxy_request_logs l
-                LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
+                LEFT JOIN provider_catalog_cache p ON l.provider_id = p.provider_id AND l.app_type = p.app_type
                 {detail_where}
                 GROUP BY l.provider_id, l.app_type
                 UNION ALL
@@ -1364,7 +1368,7 @@ impl Database {
                     COALESCE(SUM(r.success_count), 0),
                     COALESCE(SUM(r.avg_latency_ms * r.request_count), 0)
                 FROM usage_daily_rollups r
-                LEFT JOIN providers p2 ON r.provider_id = p2.id AND r.app_type = p2.app_type
+                LEFT JOIN provider_catalog_cache p2 ON r.provider_id = p2.provider_id AND r.app_type = p2.app_type
                 {rollup_where}
                 GROUP BY r.provider_id, r.app_type
             )
@@ -1415,7 +1419,8 @@ impl Database {
         provider_name: Option<&str>,
         model: Option<&str>,
     ) -> Result<Vec<ModelStats>, AppError> {
-        let conn = lock_conn!(self.conn);
+        self.refresh_provider_catalog_cache()?;
+        let conn = lock_logs_conn!(self.logs_conn);
 
         let mut detail_conditions = vec![effective_usage_log_filter("l")];
         let mut detail_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1560,7 +1565,9 @@ impl Database {
         page: u32,
         page_size: u32,
     ) -> Result<PaginatedLogs, AppError> {
-        let conn = lock_conn!(self.conn);
+        self.refresh_provider_catalog_cache()?;
+        let pricing_conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
 
         let mut conditions = vec![effective_usage_log_filter("l")];
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1603,7 +1610,7 @@ impl Database {
         // 获取总数
         let count_sql = format!(
             "SELECT COUNT(*) FROM proxy_request_logs l
-             LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
+             LEFT JOIN provider_catalog_cache p ON l.provider_id = p.provider_id AND l.app_type = p.app_type
              {where_clause}"
         );
         let count_params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -1626,7 +1633,7 @@ impl Database {
                     l.status_code, l.error_message, l.created_at, l.data_source, l.pricing_model,
                     l.input_token_semantics
              FROM proxy_request_logs l
-             LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
+             LEFT JOIN provider_catalog_cache p ON l.provider_id = p.provider_id AND l.app_type = p.app_type
              {where_clause}
              ORDER BY l.created_at DESC
              LIMIT ? OFFSET ?"
@@ -1641,7 +1648,7 @@ impl Database {
 
         for row in rows {
             let mut log = row?;
-            Self::maybe_backfill_log_costs(&conn, &mut log, &mut pricing_cache)?;
+            Self::maybe_backfill_log_costs(&conn, &pricing_conn, &mut log, &mut pricing_cache)?;
             logs.push(log);
         }
 
@@ -1658,7 +1665,9 @@ impl Database {
         &self,
         request_id: &str,
     ) -> Result<Option<RequestLogDetail>, AppError> {
-        let conn = lock_conn!(self.conn);
+        self.refresh_provider_catalog_cache()?;
+        let pricing_conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
 
         let detail_pname = provider_name_coalesce("l", "p");
         let detail_sql = format!(
@@ -1670,7 +1679,7 @@ impl Database {
                     status_code, error_message, created_at, l.data_source, l.pricing_model,
                     l.input_token_semantics
              FROM proxy_request_logs l
-             LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
+             LEFT JOIN provider_catalog_cache p ON l.provider_id = p.provider_id AND l.app_type = p.app_type
              WHERE l.request_id = ?"
         );
         let result = conn.query_row(&detail_sql, [request_id], row_to_request_log_detail);
@@ -1678,7 +1687,12 @@ impl Database {
         match result {
             Ok(mut detail) => {
                 let mut pricing_cache = HashMap::new();
-                Self::maybe_backfill_log_costs(&conn, &mut detail, &mut pricing_cache)?;
+                Self::maybe_backfill_log_costs(
+                    &conn,
+                    &pricing_conn,
+                    &mut detail,
+                    &mut pricing_cache,
+                )?;
                 Ok(Some(detail))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1692,11 +1706,10 @@ impl Database {
         provider_id: &str,
         app_type: &str,
     ) -> Result<ProviderLimitStatus, AppError> {
-        let conn = lock_conn!(self.conn);
-
         // 获取 provider 的限额设置
-        let (limit_daily, limit_monthly) = conn
-            .query_row(
+        let (limit_daily, limit_monthly) = {
+            let conn = lock_conn!(self.conn);
+            conn.query_row(
                 "SELECT meta FROM providers WHERE id = ? AND app_type = ?",
                 params![provider_id, app_type],
                 |row| {
@@ -1717,7 +1730,10 @@ impl Database {
                     .and_then(|s| s.parse::<f64>().ok());
                 (daily, monthly)
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None))
+        };
+
+        let conn = lock_logs_conn!(self.logs_conn);
 
         // 计算今日使用量 (detail logs + rollup)
         let daily_usage: f64 = conn
@@ -1800,8 +1816,9 @@ struct PricingInfo {
 impl Database {
     /// Recalculate stored zero-cost usage rows once pricing becomes available.
     pub(crate) fn backfill_missing_usage_costs(&self) -> Result<u64, AppError> {
-        let conn = lock_conn!(self.conn);
-        Self::backfill_missing_usage_costs_on_conn(&conn, None)
+        let pricing_conn = lock_conn!(self.conn);
+        let logs_conn = lock_logs_conn!(self.logs_conn);
+        Self::backfill_missing_usage_costs_on_conn(&logs_conn, &pricing_conn, None)
     }
 
     /// 仅回填指定 model_id 相关的零成本行；用于单条定价更新后的精准回填。
@@ -1809,12 +1826,14 @@ impl Database {
         &self,
         model_id: &str,
     ) -> Result<u64, AppError> {
-        let conn = lock_conn!(self.conn);
-        Self::backfill_missing_usage_costs_on_conn(&conn, Some(model_id))
+        let pricing_conn = lock_conn!(self.conn);
+        let logs_conn = lock_logs_conn!(self.logs_conn);
+        Self::backfill_missing_usage_costs_on_conn(&logs_conn, &pricing_conn, Some(model_id))
     }
 
     pub(crate) fn backfill_missing_usage_costs_on_conn(
-        conn: &Connection,
+        log_conn: &Connection,
+        pricing_conn: &Connection,
         only_model_id: Option<&str>,
     ) -> Result<u64, AppError> {
         const BASE_SQL: &str =
@@ -1831,7 +1850,7 @@ impl Database {
                     OR cache_read_tokens > 0 OR cache_creation_tokens > 0)";
 
         let mut logs = {
-            let mut stmt = conn.prepare(BASE_SQL)?;
+            let mut stmt = log_conn.prepare(BASE_SQL)?;
             let rows = stmt.query_map([], row_to_request_log_detail)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -1849,14 +1868,14 @@ impl Database {
             return Ok(0);
         }
 
-        let tx = conn
+        let tx = log_conn
             .unchecked_transaction()
             .map_err(|e| AppError::Database(format!("启动用量成本回填事务失败: {e}")))?;
 
         let mut updated = 0u64;
         let mut pricing_cache = HashMap::new();
         for log in &mut logs {
-            if Self::maybe_backfill_log_costs(&tx, log, &mut pricing_cache)? {
+            if Self::maybe_backfill_log_costs(&tx, pricing_conn, log, &mut pricing_cache)? {
                 updated += 1;
             }
         }
@@ -1872,7 +1891,8 @@ impl Database {
 
     /// 尝试为单条 log 回填成本字段。返回是否实际写入（true=已 UPDATE，false=跳过）。
     fn maybe_backfill_log_costs(
-        conn: &Connection,
+        log_conn: &Connection,
+        pricing_conn: &Connection,
         log: &mut RequestLogDetail,
         pricing_cache: &mut HashMap<String, PricingInfo>,
     ) -> Result<bool, AppError> {
@@ -1888,7 +1908,7 @@ impl Database {
             return Ok(false);
         }
 
-        let pricing = match Self::get_log_model_pricing_cached(conn, pricing_cache, log)? {
+        let pricing = match Self::get_log_model_pricing_cached(pricing_conn, pricing_cache, log)? {
             Some(info) => info,
             None => return Ok(false),
         };
@@ -1941,24 +1961,25 @@ impl Database {
         log.cache_creation_cost_usd = format!("{cache_creation_cost:.6}");
         log.total_cost_usd = format!("{total_cost:.6}");
 
-        conn.execute(
-            "UPDATE proxy_request_logs
+        log_conn
+            .execute(
+                "UPDATE proxy_request_logs
              SET input_cost_usd = ?1,
                  output_cost_usd = ?2,
                  cache_read_cost_usd = ?3,
                  cache_creation_cost_usd = ?4,
                  total_cost_usd = ?5
              WHERE request_id = ?6",
-            params![
-                log.input_cost_usd,
-                log.output_cost_usd,
-                log.cache_read_cost_usd,
-                log.cache_creation_cost_usd,
-                log.total_cost_usd,
-                log.request_id
-            ],
-        )
-        .map_err(|e| AppError::Database(format!("更新请求成本失败: {e}")))?;
+                params![
+                    log.input_cost_usd,
+                    log.output_cost_usd,
+                    log.cache_read_cost_usd,
+                    log.cache_creation_cost_usd,
+                    log.total_cost_usd,
+                    log.request_id
+                ],
+            )
+            .map_err(|e| AppError::Database(format!("更新请求成本失败: {e}")))?;
 
         Ok(true)
     }
@@ -2041,6 +2062,13 @@ pub(crate) fn find_model_pricing(conn: &Connection, model_id: &str) -> Option<Mo
         .and_then(|(input, output, cache_read, cache_creation)| {
             ModelPricing::from_strings(&input, &output, &cache_read, &cache_creation).ok()
         })
+}
+
+/// Read pricing configuration from the configuration database.
+/// Log ingestion must not query the independent log database for this table.
+pub(crate) fn find_model_pricing_for_db(db: &Database, model_id: &str) -> Option<ModelPricing> {
+    let conn = db.conn.lock().ok()?;
+    find_model_pricing(&conn, model_id)
 }
 
 pub(crate) fn find_model_pricing_row(
@@ -2558,7 +2586,7 @@ mod tests {
         let ts = local_ts(2026, 6, 10, 12, 0, 0);
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             // 一条 Claude Code 行 + 一条 Claude Desktop 网关行，同一时间窗。
             insert_usage_log(
                 &conn,
@@ -2633,7 +2661,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 "codex-gpt-5-5-zero-cost",
@@ -2653,7 +2681,7 @@ mod tests {
 
         assert_eq!(db.backfill_missing_usage_costs()?, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let (input_cost, output_cost, total_cost): (String, String, String) = conn.query_row(
             "SELECT input_cost_usd, output_cost_usd, total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'codex-gpt-5-5-zero-cost'",
@@ -2672,7 +2700,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             // v12 mirror row: input = fresh + read; creation was reported separately.
             insert_usage_log(
                 &conn,
@@ -2715,7 +2743,7 @@ mod tests {
 
         assert_eq!(db.backfill_missing_usage_costs()?, 2);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let mut stmt = conn.prepare(
             "SELECT request_id, input_cost_usd
              FROM proxy_request_logs
@@ -2745,7 +2773,7 @@ mod tests {
         // 判定收敛到 sql_helpers::is_cache_inclusive_app 后按 450 fresh 计价。
         let db = Database::memory()?;
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 "grokbuild-total-backfill",
@@ -2771,7 +2799,7 @@ mod tests {
 
         assert_eq!(db.backfill_missing_usage_costs()?, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let (input_cost, cache_read_cost, total_cost): (String, String, String) = conn.query_row(
             "SELECT input_cost_usd, cache_read_cost_usd, total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'grokbuild-total-backfill'",
@@ -2790,7 +2818,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 "codex-gpt-5-5-multiplier",
@@ -2816,7 +2844,7 @@ mod tests {
 
         assert_eq!(db.backfill_missing_usage_costs()?, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let (input_cost, total_cost): (String, String) = conn.query_row(
             "SELECT input_cost_usd, total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'codex-gpt-5-5-multiplier'",
@@ -2834,7 +2862,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,
@@ -2853,7 +2881,7 @@ mod tests {
 
         assert_eq!(db.backfill_missing_usage_costs()?, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let total_cost: String = conn.query_row(
             "SELECT total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'codex-request-model-fallback'",
@@ -2871,7 +2899,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             // 路由接管场景：model 是上游回显的真实模型（缺定价），request_model
             // 是客户端别名（有定价）。回填不得按别名定价，必须保持 0 成本等待补价。
             conn.execute(
@@ -2895,7 +2923,7 @@ mod tests {
         assert_eq!(db.backfill_missing_usage_costs()?, 0);
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             let total_cost: String = conn.query_row(
                 "SELECT total_cost_usd
                  FROM proxy_request_logs WHERE request_id = 'takeover-unpriced-model'",
@@ -2903,7 +2931,10 @@ mod tests {
                 |row| row.get(0),
             )?;
             assert_eq!(total_cost, "0");
+        }
 
+        {
+            let conn = lock_conn!(db.conn);
             // 补上真实模型定价后，回填必须按真实模型价格修复（0 成本行未被污染固化）
             conn.execute(
                 "INSERT INTO model_pricing (model_id, display_name, input_cost_per_million, output_cost_per_million)
@@ -2914,7 +2945,7 @@ mod tests {
 
         assert_eq!(db.backfill_missing_usage_costs()?, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let total_cost: String = conn.query_row(
             "SELECT total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'takeover-unpriced-model'",
@@ -2931,7 +2962,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             // request 计价模式 + 接管：写入时锚定出站模型 kimi-k2-novel（当时缺价），
             // 但上游回显了别名 → model/request_model 都是 claude-sonnet-4-6（有定价）。
             // 回填必须按落库的 pricing_model 重算，不得换用 model 列的别名价格。
@@ -2970,7 +3001,7 @@ mod tests {
             1
         );
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let total_cost: String = conn.query_row(
             "SELECT total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'persisted-pricing-model'",
@@ -2987,7 +3018,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             // 代理日志按上游原文落库：带路由前缀和 :free 后缀的别名形式。
             // 精准回填的筛选必须归一化后匹配，否则这类行要等全量回填才更新。
             insert_usage_log(
@@ -3025,7 +3056,7 @@ mod tests {
             1
         );
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let total_cost: String = conn.query_row(
             "SELECT total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'openrouter-alias-zero-cost'",
@@ -3042,7 +3073,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 "claude-cache-fresh-input",
@@ -3062,7 +3093,7 @@ mod tests {
 
         assert_eq!(db.backfill_missing_usage_costs()?, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let (input_cost, cache_read_cost, total_cost): (String, String, String) = conn.query_row(
             "SELECT input_cost_usd, cache_read_cost_usd, total_cost_usd
              FROM proxy_request_logs WHERE request_id = 'claude-cache-fresh-input'",
@@ -3082,7 +3113,7 @@ mod tests {
 
         // 插入测试数据
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model,
@@ -3115,7 +3146,7 @@ mod tests {
         let end = local_ts(2024, 1, 3, 12, 0, 0);
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO usage_daily_rollups (
                     date, app_type, provider_id, model,
@@ -3202,6 +3233,12 @@ mod tests {
                  ('prov-b', 'claude', 'DeepSeek', '{}')",
                 [],
             )?;
+        }
+
+        db.refresh_provider_catalog_cache()?;
+
+        {
+            let conn = lock_logs_conn!(db.logs_conn);
 
             insert_usage_log(
                 &conn,
@@ -3365,7 +3402,7 @@ mod tests {
         let end = local_ts(2024, 1, 2, 23, 59, 0);
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO usage_daily_rollups (
                     date, app_type, provider_id, model,
@@ -3423,7 +3460,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 "codex-proxy",
@@ -3621,7 +3658,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 "proxy-base",
@@ -3785,7 +3822,7 @@ mod tests {
 
         // 插入测试数据
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model,
@@ -3820,7 +3857,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model,
@@ -3853,7 +3890,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 "opencode-session",
@@ -3886,7 +3923,7 @@ mod tests {
         let end = local_ts(2024, 2, 3, 12, 0, 0);
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO usage_daily_rollups (
                     date, app_type, provider_id, model,
@@ -3966,7 +4003,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model,
@@ -4003,7 +4040,7 @@ mod tests {
         let end = local_ts(2024, 3, 3, 12, 0, 0);
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model,
@@ -4084,7 +4121,7 @@ mod tests {
         let end = local_ts(2024, 4, 3, 12, 0, 0);
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO usage_daily_rollups (
                     date, app_type, provider_id, model,

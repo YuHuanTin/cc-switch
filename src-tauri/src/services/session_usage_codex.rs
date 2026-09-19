@@ -14,7 +14,7 @@
 //! - `event_msg` (type=token_count) → 提取累计 token 用量，计算 delta
 
 use crate::codex_config::get_codex_config_dir;
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
@@ -22,7 +22,8 @@ use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state, update_sync_state_on_conn, SessionSyncResult,
 };
 use crate::services::usage_stats::{
-    find_model_pricing, has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
+    find_model_pricing_for_db, has_suspected_codex_session_duplicate, should_skip_session_insert,
+    DedupKey,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -367,7 +368,7 @@ pub(crate) fn reset_codex_usage_on_conn(
 impl Database {
     pub(crate) fn reset_codex_usage(&self) -> Result<(), AppError> {
         let codex_dir = get_codex_config_dir();
-        let conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
         conn.execute("SAVEPOINT reset_codex_usage", [])
             .map_err(|error| AppError::Database(format!("开启 Codex 重建事务失败: {error}")))?;
         let result = reset_codex_usage_on_conn(&conn, &codex_dir);
@@ -504,7 +505,7 @@ struct CodexSyncPass {
 
 impl CodexSyncPass {
     fn load(db: &Database) -> Result<Self, AppError> {
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let mut stmt = conn
             .prepare("SELECT file_path, last_modified, last_line_offset FROM session_log_sync")
             .map_err(|e| AppError::Database(format!("预载同步游标失败: {e}")))?;
@@ -1215,7 +1216,7 @@ fn update_codex_sync_state(
     modified: i64,
     parsed: &ParsedCodexFile,
 ) -> Result<(), AppError> {
-    let conn = lock_conn!(db.conn);
+    let conn = lock_logs_conn!(db.logs_conn);
     let tx = conn.unchecked_transaction()?;
     update_codex_sync_state_on_conn(&tx, file_path, modified, parsed)?;
     tx.commit()?;
@@ -1400,7 +1401,12 @@ fn sync_single_codex_file(
     let batch_count = to_insert.len().div_ceil(CODEX_INSERT_BATCH_SIZE);
     for (batch_index, batch) in to_insert.chunks(CODEX_INSERT_BATCH_SIZE).enumerate() {
         let is_last_batch = batch_index + 1 == batch_count;
-        let conn = lock_conn!(db.conn);
+        for (event, _) in batch {
+            pass.pricing.entry(event.model.clone()).or_insert_with(|| {
+                find_model_pricing_for_db(db, &normalize_codex_model(&event.model))
+            });
+        }
+        let conn = lock_logs_conn!(db.logs_conn);
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| AppError::Database(format!("开启 Codex 会话写入事务失败: {e}")))?;
@@ -1460,7 +1466,7 @@ fn insert_codex_session_entry(
     timestamp: Option<&str>,
     suspected_duplicates: &mut u32,
 ) -> Result<bool, AppError> {
-    let conn = lock_conn!(db.conn);
+    let conn = lock_logs_conn!(db.logs_conn);
     insert_codex_session_entry_on_conn(
         &conn,
         request_id,
@@ -1536,7 +1542,7 @@ fn insert_codex_session_entry_on_conn(
 
     let pricing = pricing_cache
         .entry(model.to_string())
-        .or_insert_with(|| find_codex_pricing(conn, model));
+        .or_insert_with(|| None);
     let multiplier = Decimal::from(1);
     let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) = match pricing
     {
@@ -1598,11 +1604,6 @@ fn insert_codex_session_entry_on_conn(
         .map_err(|e| AppError::Database(format!("插入 Codex 会话日志失败: {e}")))?;
 
     Ok(inserted_rows > 0)
-}
-
-/// 查找 Codex 模型定价（带归一化）
-fn find_codex_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<ModelPricing> {
-    find_model_pricing(conn, &normalize_codex_model(model_id))
 }
 
 #[cfg(test)]
@@ -1758,7 +1759,7 @@ mod tests {
 
     fn assert_unchanged_codex_file_is_skipped(db: &Database, file: &Path) -> Result<(), AppError> {
         let changes_before: i64 = {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.query_row("SELECT total_changes()", [], |row| row.get(0))?
         };
         // Reload the persisted cursor each time: returning zero imports alone
@@ -1766,7 +1767,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(sync_test_file(db, file, &[file])?.imported, 0);
         }
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let changes_after: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0))?;
         assert_eq!(
             changes_after, changes_before,
@@ -1831,7 +1832,7 @@ mod tests {
         // Each call reloads its cursor from the DB, as after an application restart.
         assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
         assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let totals: (i64, i64, i64) = conn.query_row(
             "SELECT count(*), sum(input_tokens), sum(output_tokens) FROM proxy_request_logs",
             [],
@@ -1859,7 +1860,7 @@ mod tests {
         update_sync_state(&db, &file.to_string_lossy(), modified, 3)?;
         assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
         assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let bytes: i64 =
             conn.query_row("SELECT last_byte_offset FROM session_log_sync", [], |r| {
                 r.get(0)
@@ -1887,7 +1888,7 @@ mod tests {
             .unwrap();
         assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
         assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let totals: (i64, i64, i64) = conn.query_row(
             "SELECT count(*), sum(input_tokens), sum(output_tokens) FROM proxy_request_logs",
             [],
@@ -1986,7 +1987,7 @@ mod tests {
 
         assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let (request_id, session_id) = conn
             .prepare(
                 "SELECT request_id, session_id FROM proxy_request_logs
@@ -2599,7 +2600,7 @@ mod tests {
             (1, 1, false)
         );
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let usage: (i64, i64, i64) = conn.query_row(
             "SELECT input_tokens, cache_read_tokens, output_tokens
              FROM proxy_request_logs WHERE request_id = ?1",
@@ -2830,7 +2831,7 @@ mod tests {
             (result.imported, result.skipped, result.deferred),
             (0, 2, false)
         );
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
             [],
@@ -3014,7 +3015,7 @@ mod tests {
             1
         );
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let request_ids = conn
             .prepare(
                 "SELECT request_id FROM proxy_request_logs
@@ -3053,7 +3054,7 @@ mod tests {
         );
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,
@@ -3078,7 +3079,7 @@ mod tests {
             0
         );
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let old_row_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM proxy_request_logs
              WHERE request_id = 'codex_session:parent:2'",
@@ -3104,7 +3105,7 @@ mod tests {
     fn test_insert_codex_session_skips_matching_proxy_log() -> Result<(), AppError> {
         let db = Database::memory()?;
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,
@@ -3147,7 +3148,7 @@ mod tests {
         )?;
         assert!(!inserted);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
             row.get(0)
         })?;
@@ -3185,7 +3186,7 @@ mod tests {
         )?);
         assert_eq!(suspected_duplicates, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
             [],
@@ -3207,7 +3208,7 @@ mod tests {
         let claude_cursor = wide_dir.join(format!("projects/rollout-{PARENT_ID}.jsonl"));
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute_batch(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, input_tokens,
@@ -3405,7 +3406,7 @@ mod tests {
 
         if let Ok(out_path) = std::env::var("CODEX_REPLAY_OUT") {
             use std::io::Write;
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             let mut stmt = conn
                 .prepare(
                     "SELECT request_id, model, request_model, input_tokens, output_tokens,

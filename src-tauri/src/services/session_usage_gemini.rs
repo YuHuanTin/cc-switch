@@ -13,15 +13,17 @@
 //! - 无需状态恢复：不依赖前一条消息的累计值
 //! - 天然去重：每条消息有唯一 id 字段
 
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::gemini_config::get_gemini_dir;
-use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
+use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
-use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
+use crate::services::usage_stats::{
+    find_model_pricing_for_db, should_skip_session_insert, DedupKey,
+};
 use rust_decimal::Decimal;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -243,7 +245,8 @@ fn insert_gemini_session_entry(
     session_id: Option<&str>,
     timestamp: Option<&str>,
 ) -> Result<bool, AppError> {
-    let conn = lock_conn!(db.conn);
+    let pricing = find_model_pricing_for_db(db, model);
+    let conn = lock_logs_conn!(db.logs_conn);
 
     let created_at = timestamp
         .and_then(|ts| {
@@ -284,7 +287,6 @@ fn insert_gemini_session_entry(
         message_id: None,
     };
 
-    let pricing = find_gemini_pricing(&conn, model);
     let multiplier = Decimal::from(1);
     let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) = match pricing
     {
@@ -364,11 +366,6 @@ fn insert_gemini_session_entry(
     Ok(changed)
 }
 
-/// 查找 Gemini 模型定价
-fn find_gemini_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<ModelPricing> {
-    find_model_pricing(conn, model_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,7 +380,7 @@ mod tests {
     fn test_insert_gemini_session_skips_matching_proxy_log() -> Result<(), AppError> {
         let db = Database::memory()?;
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,
@@ -425,7 +422,7 @@ mod tests {
         )?;
         assert!(!inserted);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
             row.get(0)
         })?;

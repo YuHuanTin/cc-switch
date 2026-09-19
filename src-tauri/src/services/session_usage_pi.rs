@@ -3,18 +3,19 @@
 //! Pi records normalized token and cost data in its session JSONL files. This
 //! importer keeps direct (non-proxy) Pi usage visible in the shared dashboard.
 
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;
-use crate::proxy::usage::calculator::CostCalculator;
+use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state_on_conn, SessionSyncResult,
 };
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_FRESH;
-use crate::services::usage_stats::find_model_pricing;
+use crate::services::usage_stats::find_model_pricing_for_db;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -224,13 +225,26 @@ fn sync_single_pi_file(
         revision.file_size,
         modified,
     )?;
-    let conn = lock_conn!(db.conn);
+    let mut pricing_cache = HashMap::new();
+    for record in &parsed.records {
+        pricing_cache
+            .entry(record.model.clone())
+            .or_insert_with(|| find_model_pricing_for_db(db, &record.model));
+    }
+
+    let conn = lock_logs_conn!(db.logs_conn);
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| AppError::Database(format!("启动 Pi 用量导入事务失败: {error}")))?;
     let mut result = SessionSyncResult::default();
     for record in &parsed.records {
-        if insert_pi_record(&tx, record)? {
+        if insert_pi_record(
+            &tx,
+            record,
+            pricing_cache
+                .get(&record.model)
+                .and_then(|pricing| pricing.as_ref()),
+        )? {
             result.imported = result.imported.saturating_add(1);
         } else {
             result.skipped = result.skipped.saturating_add(1);
@@ -758,7 +772,11 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
-fn insert_pi_record(conn: &rusqlite::Connection, record: &PiUsageRecord) -> Result<bool, AppError> {
+fn insert_pi_record(
+    conn: &rusqlite::Connection,
+    record: &PiUsageRecord,
+    pricing: Option<&ModelPricing>,
+) -> Result<bool, AppError> {
     let request_seen: bool = conn
         .query_row(
             PI_REQUEST_DEDUP_SQL,
@@ -803,7 +821,7 @@ fn insert_pi_record(conn: &rusqlite::Connection, record: &PiUsageRecord) -> Resu
         message_id: None,
     };
     let costs = record.costs.reported().or_else(|| {
-        find_model_pricing(conn, &record.model).map(|pricing| {
+        pricing.map(|pricing| {
             let calculated =
                 CostCalculator::calculate_for_app(APP_TYPE, &usage, &pricing, Decimal::ONE);
             (
@@ -905,7 +923,7 @@ mod tests {
     #[test]
     fn dedup_lookups_use_complete_identity_indexes() -> Result<(), AppError> {
         let db = Database::memory()?;
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         for (sql, expected) in [
             (PI_REQUEST_DEDUP_SQL, "(data_source=? AND request_id=?)"),
             (PI_SEMANTIC_DEDUP_SQL, "(data_source=? AND semantic_id=?)"),
@@ -951,7 +969,7 @@ mod tests {
         assert!(result.errors.is_empty());
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             let totals: (i64, i64, i64, i64, i64) = conn.query_row(
                 "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens),
                         SUM(cache_read_tokens), SUM(cache_creation_tokens)
@@ -1030,7 +1048,10 @@ mod tests {
 
         let db = Database::memory()?;
         {
-            let conn = lock_conn!(db.conn);
+            let conn = db
+                .conn
+                .lock()
+                .map_err(|_| AppError::Database("配置数据库锁失败".into()))?;
             conn.execute(
                 "INSERT OR REPLACE INTO model_pricing (
                     model_id, display_name, input_cost_per_million,
@@ -1043,7 +1064,7 @@ mod tests {
         let result = sync_pi_files(&db, std::slice::from_ref(&path));
         assert_eq!(result.imported, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let total: String = conn.query_row(
             "SELECT total_cost_usd FROM proxy_request_logs WHERE data_source = 'pi_session'",
             [],
@@ -1150,7 +1171,7 @@ mod tests {
 
         let second_pass = sync_pi_files(&db, &[parent, fork]);
         assert_eq!(second_pass.imported, 0);
-        let count: i64 = lock_conn!(db.conn).query_row(
+        let count: i64 = lock_logs_conn!(db.logs_conn).query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'pi_session'",
             [],
             |row| row.get(0),
@@ -1207,7 +1228,7 @@ mod tests {
         );
         assert_eq!(sync_pi_files(&db, std::slice::from_ref(&fork)).imported, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let rolled_up: i64 = conn.query_row(
             "SELECT COALESCE(SUM(request_count), 0) FROM usage_daily_rollups
              WHERE app_type = 'pi'",
@@ -1233,7 +1254,7 @@ mod tests {
             ],
         );
         assert_eq!(sync_pi_files(&db, std::slice::from_ref(&fork)).imported, 0);
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let totals: (i64, i64) = conn.query_row(
             "SELECT
                 (SELECT COALESCE(SUM(request_count), 0) FROM usage_daily_rollups
@@ -1267,7 +1288,7 @@ mod tests {
 
         let db = Database::memory()?;
         assert_eq!(sync_pi_files(&db, std::slice::from_ref(&path)).imported, 2);
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let statuses: Vec<(i64, String)> = conn
             .prepare(
                 "SELECT status_code, error_message FROM proxy_request_logs
@@ -1403,7 +1424,7 @@ mod tests {
         write_lines(&current, &[header, &eleven]);
         let correction = sync_pi_files(&db, std::slice::from_ref(&current));
         assert_eq!((correction.imported, correction.skipped), (0, 1));
-        let current_count: i64 = lock_conn!(db.conn).query_row(
+        let current_count: i64 = lock_logs_conn!(db.logs_conn).query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'pi_session'",
             [],
             |row| row.get(0),
@@ -1428,7 +1449,7 @@ mod tests {
             (0, 1)
         );
 
-        let legacy_count: i64 = lock_conn!(legacy_db.conn).query_row(
+        let legacy_count: i64 = lock_logs_conn!(legacy_db.logs_conn).query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'pi_session'",
             [],
             |row| row.get(0),
@@ -1509,7 +1530,7 @@ mod tests {
         );
         set_modified(&path, preserved_mtime);
         assert_eq!(sync_pi_files(&db, std::slice::from_ref(&path)).imported, 1);
-        let count: i64 = lock_conn!(db.conn).query_row(
+        let count: i64 = lock_logs_conn!(db.logs_conn).query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'pi_session'",
             [],
             |row| row.get(0),

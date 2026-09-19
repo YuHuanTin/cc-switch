@@ -32,7 +32,7 @@
 //!   落库），插入前按事件时刻查询附近是否存在代理直录行（见
 //!   `has_recent_grokbuild_proxy_activity`）。
 
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
@@ -41,7 +41,8 @@ use crate::services::session_usage::{
 };
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_TOTAL;
 use crate::services::usage_stats::{
-    find_model_pricing, has_recent_grokbuild_proxy_activity, SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+    find_model_pricing_for_db, has_recent_grokbuild_proxy_activity,
+    SESSION_PROXY_DEDUP_WINDOW_SECONDS,
 };
 use rust_decimal::Decimal;
 use std::fs;
@@ -243,7 +244,7 @@ fn sync_single_grok_file(
         // 被守卫跳过的 token 已由代理行记账，跳过即终态（同步状态照常
         // 推进）。已知局限：守卫无 session 维度，见 usage_stats.rs 注释。
         let takeover_active = {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             has_recent_grokbuild_proxy_activity(&conn, event.created_at)?
         };
 
@@ -415,7 +416,8 @@ fn insert_grok_session_entry(
     session_id: &str,
     created_at: i64,
 ) -> Result<bool, AppError> {
-    let conn = lock_conn!(db.conn);
+    let pricing = find_model_pricing_for_db(db, model);
+    let conn = lock_logs_conn!(db.logs_conn);
 
     let clamp = |v: u64| v.min(u32::MAX as u64) as u32;
     let usage = TokenUsage {
@@ -427,7 +429,6 @@ fn insert_grok_session_entry(
         message_id: None,
     };
 
-    let pricing = find_model_pricing(&conn, model);
     let multiplier = Decimal::from(1);
     let reported = turn.reported_cost_usd();
     // 插入成功（changed）后才发，避免重扫时重复刷日志
@@ -639,7 +640,7 @@ mod tests {
     type GrokSessionRow = (String, u32, u32, u32, i64);
 
     fn query_rows(db: &Database) -> Result<Vec<GrokSessionRow>, AppError> {
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let mut stmt = conn
             .prepare(
                 "SELECT request_id, input_tokens, output_tokens, cache_read_tokens, input_token_semantics
@@ -663,7 +664,7 @@ mod tests {
     }
 
     fn query_costs(db: &Database) -> Result<Vec<(String, String)>, AppError> {
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let mut stmt = conn
             .prepare(
                 "SELECT request_id, total_cost_usd FROM proxy_request_logs
@@ -904,7 +905,7 @@ mod tests {
     fn takeover_guard_skips_events_near_proxy_activity() -> Result<(), AppError> {
         let db = Database::memory()?;
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,
@@ -995,7 +996,7 @@ mod tests {
 
         // 强制重读（清同步状态）→ UPSERT 全部无变化
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute("DELETE FROM session_log_sync", [])?;
         }
         let third = sync_single_grok_file(
@@ -1049,7 +1050,7 @@ mod tests {
         let truncated = vec![full[0].clone(), full[2].clone()];
         write_session_file(temp.path(), "sess-rewind", &truncated);
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute("DELETE FROM session_log_sync", [])?;
         }
 
@@ -1116,7 +1117,7 @@ mod tests {
         )?;
         assert_eq!(result.imported, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let total: String = conn.query_row(
             "SELECT total_cost_usd FROM proxy_request_logs WHERE data_source = 'grok_session'",
             [],
@@ -1149,7 +1150,7 @@ mod tests {
         )?;
         assert_eq!(result.imported, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let total: String = conn.query_row(
             "SELECT total_cost_usd FROM proxy_request_logs WHERE data_source = 'grok_session'",
             [],
@@ -1182,7 +1183,7 @@ mod tests {
         )?;
         assert_eq!(result.imported, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let (input_cost, total): (String, String) = conn.query_row(
             "SELECT input_cost_usd, total_cost_usd FROM proxy_request_logs
              WHERE data_source = 'grok_session'",
@@ -1223,7 +1224,7 @@ mod tests {
         )?;
         assert_eq!(result.imported, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let total: String = conn.query_row(
             "SELECT total_cost_usd FROM proxy_request_logs WHERE data_source = 'grok_session'",
             [],
@@ -1255,7 +1256,7 @@ mod tests {
         )?;
         assert_eq!(result.imported, 1);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let (input_cost, total): (String, String) = conn.query_row(
             "SELECT input_cost_usd, total_cost_usd FROM proxy_request_logs
              WHERE data_source = 'grok_session'",

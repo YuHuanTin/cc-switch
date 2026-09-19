@@ -2,7 +2,7 @@
 //!
 //! 提供 SQL 导出/导入和二进制快照备份功能。
 
-use super::{lock_conn, Database};
+use super::{lock_conn, lock_logs_conn, Database};
 use crate::config::get_app_config_dir;
 use crate::error::AppError;
 use chrono::{Local, Utc};
@@ -83,26 +83,14 @@ fn import_authorizer(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hoo
 }
 
 /// Tables whose data rows are skipped when exporting for WebDAV sync.
-const SYNC_SKIP_TABLES: &[&str] = &[
-    "proxy_request_logs",
-    "stream_check_logs",
-    "provider_health",
-    "proxy_live_backup",
-    "usage_daily_rollups",
-    "session_log_sync",
-    "session_usage_dedup",
-];
+// Request/usage logs live in cc-switch-logs.db and are therefore absent from
+// configuration exports already.  proxy_live_backup is configuration-local
+// runtime state and must not overwrite the destination during sync.
+const SYNC_SKIP_TABLES: &[&str] = &["proxy_live_backup"];
 
 /// Tables whose local data is preserved from the live database during WebDAV import.
 /// Excludes ephemeral tables like provider_health that can safely rebuild at runtime.
-const SYNC_PRESERVE_TABLES: &[&str] = &[
-    "proxy_request_logs",
-    "stream_check_logs",
-    "proxy_live_backup",
-    "usage_daily_rollups",
-    "session_log_sync",
-    "session_usage_dedup",
-];
+const SYNC_PRESERVE_TABLES: &[&str] = &["proxy_live_backup"];
 
 /// A database backup entry for the UI
 #[derive(Debug, serde::Serialize)]
@@ -219,9 +207,11 @@ impl Database {
         // can create missing tables and accidentally make a truncated file look valid.
         Self::validate_imported_schema(&temp_conn)?;
 
-        // 补齐缺失表/索引并执行迁移
+        // 补齐配置表/索引并执行迁移。旧版单库导出可能包含日志表，迁移
+        // 完成后立即移除它们，防止日志数据落回配置库。
         Self::create_tables_on_conn(&temp_conn)?;
         Self::apply_schema_migrations_on_conn(&temp_conn)?;
+        Self::drop_legacy_log_tables(&temp_conn)?;
         on_staging_ready()?;
 
         let backup_file_guard = lock_backup_file_operations()?;
@@ -245,7 +235,24 @@ impl Database {
             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
             .unwrap_or_default();
 
+        // Provider health is runtime state. Configuration replacement can
+        // remove or change provider IDs, so old health rows must not survive
+        // the replacement.
+        if let Err(e) = self.reset_provider_runtime_state() {
+            log::warn!("配置导入后刷新供应商运行态失败: {e}");
+        }
+
         Ok(backup_id)
+    }
+
+    fn reset_provider_runtime_state(&self) -> Result<(), AppError> {
+        {
+            let logs_conn = lock_logs_conn!(self.logs_conn);
+            logs_conn
+                .execute("DELETE FROM provider_health", [])
+                .map_err(|e| AppError::Database(format!("清理供应商健康状态失败: {e}")))?;
+        }
+        self.refresh_provider_catalog_cache()
     }
 
     /// 创建内存快照以避免长时间持有数据库锁
@@ -463,8 +470,8 @@ impl Database {
             }
         }
         if reclaimed_rows > 0 {
-            let conn = lock_conn!(self.conn);
-            if let Err(e) = conn.execute_batch("PRAGMA incremental_vacuum;") {
+            let logs_conn = lock_logs_conn!(self.logs_conn);
+            if let Err(e) = logs_conn.execute_batch("PRAGMA incremental_vacuum;") {
                 log::warn!("Periodic incremental vacuum failed: {e}");
             }
         }
@@ -1061,6 +1068,7 @@ impl Database {
         Self::ensure_incremental_auto_vacuum_on_conn(&staging_conn)?;
         Self::create_tables_on_conn(&staging_conn)?;
         Self::apply_schema_migrations_on_conn(&staging_conn)?;
+        Self::drop_legacy_log_tables(&staging_conn)?;
         Self::ensure_model_pricing_seeded_on_conn(&staging_conn)?;
         Self::validate_sqlite_integrity(&staging_conn)?;
 
@@ -1450,14 +1458,21 @@ mod tests {
         let source = Database::memory()?;
         {
             let conn = crate::database::lock_conn!(source.conn);
-            conn.execute_batch(
+            conn.execute(
                 "INSERT INTO providers (id, app_type, name, settings_config, meta)
-                 VALUES ('file-provider', 'claude', 'File Provider', '{}', '{}');
-                 INSERT INTO proxy_request_logs (
+                 VALUES ('file-provider', 'claude', 'File Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+        {
+            let conn = crate::database::lock_logs_conn!(source.logs_conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
                      request_id, provider_id, app_type, model,
                      input_tokens, output_tokens, total_cost_usd,
                      latency_ms, status_code, created_at
-                 ) VALUES ('file-request', 'file-provider', 'claude', 'claude-file', 5, 3, '0', 10, 200, 1);",
+                 ) VALUES ('file-request', 'file-provider', 'claude', 'claude-file', 5, 3, '0', 10, 200, 1)",
+                [],
             )?;
         }
 
@@ -1481,12 +1496,13 @@ mod tests {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(providers, vec!["file-provider"]);
-        let request_exists: bool = conn.query_row(
+        let logs_conn = crate::database::lock_logs_conn!(target.logs_conn);
+        let request_exists: bool = logs_conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM proxy_request_logs WHERE request_id = 'file-request')",
             [],
             |row| row.get(0),
         )?;
-        assert!(request_exists, "文件 API 必须完整恢复导出数据");
+        assert!(!request_exists, "文件 API 不应恢复独立日志库数据");
         Ok(())
     }
 
@@ -2118,15 +2134,21 @@ mod tests {
 
     #[test]
     #[serial]
-    fn full_sql_backup_still_round_trips_session_cursors() -> Result<(), AppError> {
+    fn full_sql_backup_excludes_session_cursors() -> Result<(), AppError> {
         let _test_home = TestHomeGuard::new();
         let source = Database::memory()?;
         {
             let conn = crate::database::lock_conn!(source.conn);
-            conn.execute_batch(
+            conn.execute(
                 "INSERT INTO providers (id, app_type, name, settings_config, meta)
-                 VALUES ('cursor-provider', 'claude', 'Cursor Provider', '{}', '{}');
-                 INSERT INTO session_log_sync (
+                 VALUES ('cursor-provider', 'claude', 'Cursor Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+        {
+            let conn = crate::database::lock_logs_conn!(source.logs_conn);
+            conn.execute_batch(
+                "INSERT INTO session_log_sync (
                      file_path, last_modified, last_line_offset, last_synced_at
                  ) VALUES ('/local/sessions/manual-backup.jsonl', 11, 22, 33);",
             )?;
@@ -2136,17 +2158,12 @@ mod tests {
         let target = Database::memory()?;
         target.import_sql_string(&sql)?;
 
-        let conn = crate::database::lock_conn!(target.conn);
-        let cursor: (String, i64, i64, i64) = conn.query_row(
-            "SELECT file_path, last_modified, last_line_offset, last_synced_at
-             FROM session_log_sync",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        assert_eq!(
-            cursor,
-            ("/local/sessions/manual-backup.jsonl".into(), 11, 22, 33,)
-        );
+        let conn = crate::database::lock_logs_conn!(target.logs_conn);
+        let cursor_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM session_log_sync", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(cursor_count, 0, "配置备份不应携带日志库游标");
         Ok(())
     }
 
@@ -2167,10 +2184,21 @@ mod tests {
         let remote_db = Database::memory()?;
         {
             let conn = crate::database::lock_conn!(remote_db.conn);
-            conn.execute_batch(
+            conn.execute(
                 "INSERT INTO providers (id, app_type, name, settings_config, meta)
-                 VALUES ('remote-provider', 'claude', 'Remote Provider', '{}', '{}');
-                 INSERT INTO proxy_request_logs (
+                 VALUES ('remote-provider', 'claude', 'Remote Provider', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at)
+                 VALUES ('claude', 'remote-live', '2099-01-01')",
+                [],
+            )?;
+        }
+        {
+            let conn = crate::database::lock_logs_conn!(remote_db.logs_conn);
+            conn.execute_batch(
+                "INSERT INTO proxy_request_logs (
                      request_id, provider_id, app_type, model,
                      input_tokens, output_tokens, total_cost_usd,
                      latency_ms, status_code, created_at
@@ -2184,8 +2212,6 @@ mod tests {
                      provider_id, provider_name, app_type, status, success, message,
                      response_time_ms, http_status, model_used, retry_count, tested_at
                  ) VALUES ('remote-provider', 'Remote Provider', 'claude', 'failed', 0, 'remote', 1, 500, 'remote-model', 0, 1);
-                 INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at)
-                 VALUES ('claude', 'remote-live', '2099-01-01');
                  INSERT INTO provider_health (
                      provider_id, app_type, is_healthy, consecutive_failures, updated_at
                  ) VALUES ('remote-provider', 'claude', 0, 9, '2099-01-01');
@@ -2195,37 +2221,27 @@ mod tests {
             )?;
         }
         let remote_sql = remote_db.export_sql_string_for_sync()?;
-        let exported = Connection::open_in_memory()?;
-        exported.execute_batch(&remote_sql)?;
-        let skipped_counts: (i64, i64, i64, i64, i64, i64) = exported.query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM proxy_request_logs),
-                (SELECT COUNT(*) FROM stream_check_logs),
-                (SELECT COUNT(*) FROM provider_health),
-                (SELECT COUNT(*) FROM proxy_live_backup),
-                (SELECT COUNT(*) FROM usage_daily_rollups),
-                (SELECT COUNT(*) FROM session_log_sync)",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )?;
-        assert_eq!(skipped_counts, (0, 0, 0, 0, 0, 0));
+        assert!(!remote_sql.contains("proxy_request_logs"));
+        assert!(!remote_sql.contains("session_log_sync"));
 
         let local_db = Database::memory()?;
         {
             let conn = crate::database::lock_conn!(local_db.conn);
-            conn.execute_batch(
+            conn.execute(
                 "INSERT INTO providers (id, app_type, name, settings_config, meta)
-                 VALUES ('local-provider', 'claude', 'Local Provider', '{}', '{}');
-                 INSERT INTO proxy_request_logs (
+                 VALUES ('local-provider', 'claude', 'Local Provider', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at)
+                 VALUES ('claude', '{\"local\":true}', '2026-03-01')",
+                [],
+            )?;
+        }
+        {
+            let conn = crate::database::lock_logs_conn!(local_db.logs_conn);
+            conn.execute_batch(
+                "INSERT INTO proxy_request_logs (
                      request_id, provider_id, app_type, model,
                      input_tokens, output_tokens, total_cost_usd,
                      latency_ms, status_code, created_at
@@ -2239,8 +2255,6 @@ mod tests {
                      provider_id, provider_name, app_type, status, success, message,
                      response_time_ms, http_status, model_used, retry_count, tested_at
                  ) VALUES ('local-provider', 'Local Provider', 'claude', 'operational', 1, 'local-ok', 42, 200, 'claude-3', 0, 1000);
-                 INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at)
-                 VALUES ('claude', '{\"local\":true}', '2026-03-01');
                  INSERT INTO provider_health (
                      provider_id, app_type, is_healthy, consecutive_failures, updated_at
                  ) VALUES ('local-provider', 'claude', 1, 0, '2026-03-01');
@@ -2259,32 +2273,26 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(providers, vec!["remote-provider"]);
 
-        let preserved_counts: (i64, i64, i64, i64, i64) = conn.query_row(
+        drop(conn);
+        let logs_conn = crate::database::lock_logs_conn!(local_db.logs_conn);
+        let preserved_counts: (i64, i64, i64, i64) = logs_conn.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM proxy_request_logs),
                 (SELECT COUNT(*) FROM stream_check_logs),
-                (SELECT COUNT(*) FROM proxy_live_backup),
                 (SELECT COUNT(*) FROM usage_daily_rollups),
                 (SELECT COUNT(*) FROM session_log_sync)",
             [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         assert_eq!(
             preserved_counts,
-            (1, 1, 1, 1, 1),
-            "同步导入必须替换配置，同时保留本机日志、Live 备份与会话游标"
+            (1, 1, 1, 1),
+            "同步导入必须替换配置，同时保留本机独立日志库"
         );
 
-        let preserved_values: (String, String, i64, String, i64, String, i64) = conn.query_row(
-            "SELECT
+        let preserved_values: (String, String, i64, String, i64, String, i64) = logs_conn
+            .query_row(
+                "SELECT
                 (SELECT request_id FROM proxy_request_logs),
                 (SELECT model FROM proxy_request_logs),
                 (SELECT input_tokens FROM proxy_request_logs),
@@ -2292,19 +2300,19 @@ mod tests {
                 (SELECT request_count FROM usage_daily_rollups),
                 (SELECT message FROM stream_check_logs),
                 (SELECT response_time_ms FROM stream_check_logs)",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            },
-        )?;
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )?;
         assert_eq!(
             preserved_values,
             (
@@ -2318,6 +2326,14 @@ mod tests {
             )
         );
 
+        let provider_health_count: i64 =
+            logs_conn.query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))?;
+        assert_eq!(
+            provider_health_count, 0,
+            "配置同步后供应商健康状态必须从运行态重新开始"
+        );
+        drop(logs_conn);
+        let conn = crate::database::lock_conn!(local_db.conn);
         let live_backup: (String, String) = conn.query_row(
             "SELECT original_config, backed_up_at FROM proxy_live_backup WHERE app_type = 'claude'",
             [],
@@ -2326,22 +2342,6 @@ mod tests {
         assert_eq!(
             live_backup,
             ("{\"local\":true}".into(), "2026-03-01".into())
-        );
-        let session_cursor: (String, i64, i64, i64) = conn.query_row(
-            "SELECT file_path, last_modified, last_line_offset, last_synced_at
-             FROM session_log_sync",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        assert_eq!(
-            session_cursor,
-            ("/local/sessions/one.jsonl".into(), 10, 123, 456)
-        );
-        let provider_health_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))?;
-        assert_eq!(
-            provider_health_count, 0,
-            "同步导入应清除可重建的本地 provider_health 状态"
         );
         Ok(())
     }
@@ -2569,7 +2569,7 @@ mod tests {
             || {
                 // Deterministically simulate writes after the remote SQL has
                 // finished staging but before the main database is replaced.
-                let conn = crate::database::lock_conn!(local_db.conn);
+                let conn = crate::database::lock_logs_conn!(local_db.logs_conn);
                 conn.execute_batch(
                     "INSERT INTO proxy_request_logs (
                          request_id, provider_id, app_type, model,
@@ -2585,11 +2585,16 @@ mod tests {
                          provider_id, provider_name, app_type, status, success, message,
                          response_time_ms, http_status, model_used, retry_count, tested_at
                      ) VALUES ('local-provider', 'Local Provider', 'claude', 'operational', 1, 'late', 1, 200, 'late-model', 0, 1);
-                     INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at)
-                     VALUES ('claude', 'late-live', '2026-08-04');
                      INSERT INTO session_log_sync (
                          file_path, last_modified, last_line_offset, last_synced_at
                      ) VALUES ('/local/sessions/late.jsonl', 1, 2, 3);",
+                )?;
+                drop(conn);
+                let conn = crate::database::lock_conn!(local_db.conn);
+                conn.execute(
+                    "INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at)
+                     VALUES ('claude', 'late-live', '2026-08-04')",
+                    [],
                 )?;
                 Ok(())
             },
@@ -2601,12 +2606,13 @@ mod tests {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(providers, vec!["remote-provider"]);
-        let preserved_counts: (i64, i64, i64, i64, i64) = conn.query_row(
+        drop(conn);
+        let logs_conn = crate::database::lock_logs_conn!(local_db.logs_conn);
+        let preserved_counts: (i64, i64, i64, i64) = logs_conn.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = 'late-request'),
                 (SELECT COUNT(*) FROM usage_daily_rollups WHERE date = '2026-08-04'),
                 (SELECT COUNT(*) FROM stream_check_logs WHERE message = 'late'),
-                (SELECT COUNT(*) FROM proxy_live_backup WHERE original_config = 'late-live'),
                 (SELECT COUNT(*) FROM session_log_sync WHERE file_path = '/local/sessions/late.jsonl')",
             [],
             |row| {
@@ -2615,11 +2621,18 @@ mod tests {
                     row.get(1)?,
                     row.get(2)?,
                     row.get(3)?,
-                    row.get(4)?,
                 ))
             },
         )?;
-        assert_eq!(preserved_counts, (1, 1, 1, 1, 1));
+        assert_eq!(preserved_counts, (1, 1, 1, 1));
+        drop(logs_conn);
+        let conn = crate::database::lock_conn!(local_db.conn);
+        let live_backup_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_live_backup WHERE original_config = 'late-live'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(live_backup_count, 1);
         Ok(())
     }
 
@@ -2653,7 +2666,7 @@ mod tests {
             &remote_sql,
             super::SYNC_PRESERVE_TABLES,
             || {
-                let conn = crate::database::lock_conn!(local_db.conn);
+                let conn = crate::database::lock_logs_conn!(local_db.logs_conn);
                 conn.execute(
                     "INSERT INTO proxy_request_logs (
                          request_id, provider_id, app_type, model,
@@ -2672,6 +2685,9 @@ mod tests {
             let live_provider: String =
                 conn.query_row("SELECT id FROM providers", [], |row| row.get(0))?;
             assert_eq!(live_provider, "remote-provider");
+        }
+        {
+            let conn = crate::database::lock_logs_conn!(local_db.logs_conn);
             let late_request_count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = 'late-request'",
                 [],
@@ -2691,15 +2707,13 @@ mod tests {
             safety_provider, "local-provider",
             "safety backup must capture the exact pre-import provider state"
         );
-        let safety_late_request_count: i64 = safety_conn.query_row(
-            "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = 'late-request'",
+        let safety_log_table_count: i64 = safety_conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'proxy_request_logs'",
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(
-            safety_late_request_count, 1,
-            "safety backup must include writes that arrived after staging"
-        );
+        assert_eq!(safety_log_table_count, 0, "配置安全备份不应包含独立日志库");
         Ok(())
     }
 
@@ -3044,7 +3058,7 @@ mod tests {
         let old_stream_ts = now - 8 * 86400;
 
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model,
@@ -3065,7 +3079,7 @@ mod tests {
         db.periodic_backup_if_needed()?;
 
         let (remaining_request_logs, stream_logs, rollups): (i64, i64, i64) = {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             let remaining_request_logs =
                 conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
                     row.get(0)

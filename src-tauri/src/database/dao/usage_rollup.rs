@@ -2,7 +2,7 @@
 //!
 //! Aggregates proxy_request_logs into daily rollups and prunes old detail rows.
 
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_conn, lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::services::sql_helpers::{fresh_input_sql, INPUT_TOKEN_SEMANTICS_FRESH};
 use crate::services::usage_stats::effective_usage_log_filter;
@@ -61,7 +61,8 @@ impl Database {
     /// Returns the number of deleted detail rows.
     pub fn rollup_and_prune(&self, retain_days: i64) -> Result<u64, AppError> {
         let cutoff = compute_local_midnight_cutoff(Local::now(), retain_days)?;
-        let conn = lock_conn!(self.conn);
+        let pricing_conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
 
         // Check if there are any rows to process
         let count: i64 = conn
@@ -81,7 +82,7 @@ impl Database {
         // 之后；周期任务同理）。所以剪枝前先尽力回填一次。失败仅告警不阻断——
         // 否则一行损坏的定价数据会永久卡死日志清理。
         // 注意必须在 SAVEPOINT 之外调用：回填内部自己开顶层事务。
-        if let Err(e) = Self::backfill_missing_usage_costs_on_conn(&conn, None) {
+        if let Err(e) = Self::backfill_missing_usage_costs_on_conn(&conn, &pricing_conn, None) {
             log::warn!("Pre-prune cost backfill failed, pruning anyway: {e}");
         }
 
@@ -237,7 +238,7 @@ mod tests {
         let recent_ts = now - 5 * 86400; // 5 days ago
 
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             for i in 0..5 {
                 conn.execute(
                     "INSERT INTO proxy_request_logs (
@@ -264,7 +265,7 @@ mod tests {
         assert_eq!(deleted, 5);
 
         // Verify rollup data
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let count: i64 = conn.query_row(
             "SELECT request_count FROM usage_daily_rollups WHERE app_type = 'claude'",
             [],
@@ -288,7 +289,7 @@ mod tests {
         let old_ts = now - 40 * 86400;
 
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,
@@ -310,7 +311,7 @@ mod tests {
         let deleted = db.rollup_and_prune(30)?;
         assert_eq!(deleted, 2);
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let mut stmt = conn.prepare(
             "SELECT provider_id, request_count, input_tokens, output_tokens, cache_read_tokens
              FROM usage_daily_rollups WHERE app_type = 'codex'",
@@ -350,7 +351,7 @@ mod tests {
         let old_ts = chrono::Utc::now().timestamp() - 40 * 86400;
 
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model,
@@ -365,7 +366,7 @@ mod tests {
 
         assert_eq!(db.rollup_and_prune(30)?, 1);
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let row: (i64, i64, i64, i64) = conn.query_row(
             "SELECT input_tokens, cache_read_tokens, cache_creation_tokens,
                     input_token_semantics
@@ -385,7 +386,7 @@ mod tests {
         let old_ts = now - 40 * 86400;
 
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             // 路由接管行：model 是真实上游模型，request_model 是客户端别名。
             // 同 model 下两个不同别名必须各自成行，prune 后映射关系仍可审计。
             for (i, request_model) in [
@@ -407,7 +408,7 @@ mod tests {
         let deleted = db.rollup_and_prune(30)?;
         assert_eq!(deleted, 3);
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let mut stmt = conn.prepare(
             "SELECT request_model, request_count FROM usage_daily_rollups
              WHERE model = 'kimi-k2' ORDER BY request_model",
@@ -435,7 +436,7 @@ mod tests {
         let old_ts = now - 40 * 86400;
 
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             // request 计价模式下 pricing_model 与 model 分叉，必须各自成行
             conn.execute(
                 "INSERT INTO proxy_request_logs (
@@ -460,7 +461,7 @@ mod tests {
         let deleted = db.rollup_and_prune(30)?;
         assert_eq!(deleted, 2);
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let mut stmt = conn.prepare(
             "SELECT pricing_model, total_cost_usd FROM usage_daily_rollups
              WHERE model = 'kimi-k2' ORDER BY pricing_model",
@@ -484,7 +485,7 @@ mod tests {
         let old_ts = now - 40 * 86400;
 
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             // >30 天的 0 成本行：pricing_model（gpt-5.5）在 seed 定价表中有价。
             // 剪枝是不可逆的，rollup 必须先回填再汇总，否则按 0 永久入账。
             conn.execute(
@@ -501,7 +502,7 @@ mod tests {
         let deleted = db.rollup_and_prune(30)?;
         assert_eq!(deleted, 1);
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let total_cost: f64 = conn.query_row(
             "SELECT CAST(total_cost_usd AS REAL) FROM usage_daily_rollups
              WHERE model = 'gpt-5.5'",
@@ -530,7 +531,7 @@ mod tests {
         let old_ts = now - 40 * 86400;
 
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             let date_str = Local
                 .timestamp_opt(old_ts, 0)
                 .single()
@@ -559,7 +560,7 @@ mod tests {
         let deleted = db.rollup_and_prune(30)?;
         assert_eq!(deleted, 3);
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let (count, input): (i64, i64) = conn.query_row(
             "SELECT request_count, input_tokens FROM usage_daily_rollups
              WHERE app_type = 'claude' AND provider_id = 'p1'",

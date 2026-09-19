@@ -2,7 +2,7 @@
 //!
 //! 管理代理模式下的故障转移队列（基于 providers 表的 in_failover_queue 字段）
 
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_conn, lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::provider::Provider;
 use serde::{Deserialize, Serialize};
@@ -79,21 +79,24 @@ impl Database {
         app_type: &str,
         provider_id: &str,
     ) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
-
-        // 1. 从队列中移除
-        conn.execute(
-            "UPDATE providers SET in_failover_queue = 0 WHERE id = ?1 AND app_type = ?2",
-            rusqlite::params![provider_id, app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        {
+            let conn = lock_conn!(self.conn);
+            // 1. 从队列中移除
+            conn.execute(
+                "UPDATE providers SET in_failover_queue = 0 WHERE id = ?1 AND app_type = ?2",
+                rusqlite::params![provider_id, app_type],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
 
         // 2. 清除该供应商的健康状态（退出队列后不再需要健康监控）
-        conn.execute(
-            "DELETE FROM provider_health WHERE provider_id = ?1 AND app_type = ?2",
-            rusqlite::params![provider_id, app_type],
-        )
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let logs_conn = lock_logs_conn!(self.logs_conn);
+        logs_conn
+            .execute(
+                "DELETE FROM provider_health WHERE provider_id = ?1 AND app_type = ?2",
+                rusqlite::params![provider_id, app_type],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         log::info!("已从故障转移队列移除供应商 {provider_id} ({app_type}), 并清除其健康状态");
 
