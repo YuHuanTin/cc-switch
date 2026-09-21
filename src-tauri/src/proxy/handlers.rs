@@ -2212,7 +2212,7 @@ async fn responses_sse_stream_to_anthropic_message(
 ///
 /// 复用 `proxy::sse` 的 `take_sse_block`/`strip_sse_field`：`take_sse_block` 同时支持
 /// `\n\n` 与 `\r\n\r\n` 两种分隔符，`strip_sse_field` 兼容带/不带空格的字段写法。
-fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
+pub(crate) fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     let mut buffer = body.trim_start_matches('\u{feff}').to_string();
     let mut completed_response: Option<Value> = None;
     let mut output_items = Vec::new();
@@ -2438,7 +2438,7 @@ fn sse_block_parts(block: &str) -> Option<(String, String)> {
 /// reasoning / reasoning_details）经 codex_chat_common 公共提取器并入同一累加器；
 /// finish_reason 首个非 null 即锁定（kimi-k2.6 会在 tool_use 后再发带
 /// finish_reason 的尾块，见 streaming.rs）。
-fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
+pub(crate) fn chat_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     // 剥 BOM：嗅探器接受 BOM 开头，但 strip_sse_field 按行首精确匹配，
     // 不剥会让首个 data 行静默丢失
     let mut buffer = body.trim_start_matches('\u{feff}').to_string();
