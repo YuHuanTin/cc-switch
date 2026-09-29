@@ -13,20 +13,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-apple-signing:
+    name: Check Apple signing credentials
+    runs-on: ubuntu-22.04
+    environment: release
+    outputs:
+      matrix: ${{ steps.check.outputs.matrix }}
+    steps:
+      - name: Check required Apple secrets
+        id: check
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ] && \
+             [ -n "$APPLE_CERTIFICATE_PASSWORD" ] && \
+             [ -n "$KEYCHAIN_PASSWORD" ] && \
+             [ -n "$APPLE_ID" ] && \
+             [ -n "$APPLE_PASSWORD" ] && \
+             [ -n "$APPLE_TEAM_ID" ]; then
+            echo 'matrix={"include":[{"os":"windows-2022"},{"os":"windows-11-arm","arch":"arm64"},{"os":"ubuntu-22.04"},{"os":"ubuntu-22.04-arm","arch":"arm64"},{"os":"macos-14"}]}' >> "$GITHUB_OUTPUT"
+            echo "Apple signing credentials are configured"
+          else
+            echo 'matrix={"include":[{"os":"windows-2022"},{"os":"windows-11-arm","arch":"arm64"},{"os":"ubuntu-22.04"},{"os":"ubuntu-22.04-arm","arch":"arm64"}]}' >> "$GITHUB_OUTPUT"
+            echo "Apple signing credentials are not configured; macOS build will be skipped"
+          fi
+
   release:
     runs-on: ${{ matrix.os }}
     environment: release
+    needs: check-apple-signing
+    outputs:
+      updater_enabled: ${{ steps.tauri-build-config.outputs.updater_enabled }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: windows-2022
-          - os: windows-11-arm
-            arch: arm64
-          - os: ubuntu-22.04
-          - os: ubuntu-22.04-arm
-            arch: arm64
-          - os: macos-14
+      matrix: ${{ fromJSON(needs.check-apple-signing.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -122,17 +148,30 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
-      - name: Prepare Tauri signing key
+      - name: Configure Tauri updater signing
+        id: tauri-build-config
         shell: bash
+        env:
+          TAURI_PRIVATE_KEY_RAW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          # 调试：检查 Secret 是否存在
-          if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
-            echo "❌ TAURI_SIGNING_PRIVATE_KEY Secret 为空或不存在" >&2
-            echo "请检查 GitHub 仓库 Settings > Secrets and variables > Actions" >&2
-            exit 1
+          set -euo pipefail
+          CONFIG_PATH="src-tauri/tauri.ci.json"
+          echo "TAURI_BUILD_CONFIG=$CONFIG_PATH" >> "$GITHUB_ENV"
+
+          if [ -z "$TAURI_PRIVATE_KEY_RAW" ]; then
+            printf '%s\n' '{"bundle":{"createUpdaterArtifacts":false}}' > "$CONFIG_PATH"
+            echo "TAURI_UPDATER_ENABLED=false" >> "$GITHUB_ENV"
+            echo "updater_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "TAURI_SIGNING_PRIVATE_KEY is not configured; updater artifacts disabled for this build"
+            exit 0
           fi
-          
-          RAW="${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
+
+          printf '%s\n' '{}' > "$CONFIG_PATH"
+          echo "TAURI_UPDATER_ENABLED=true" >> "$GITHUB_ENV"
+          echo "updater_enabled=true" >> "$GITHUB_OUTPUT"
+
+          RAW="$TAURI_PRIVATE_KEY_RAW"
           # 目标：提供正确的私钥“文件路径”给 Tauri CLI，避免内容解码歧义
           KEY_PATH="$RUNNER_TEMP/tauri_signing.key"
           # 情况 1：原始两行文本（第一行以 "untrusted comment:" 开头）
@@ -173,8 +212,8 @@ jobs:
             exit 1
           fi
           echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> $GITHUB_ENV
+          if [ -n "$TAURI_PRIVATE_KEY_PASSWORD" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$TAURI_PRIVATE_KEY_PASSWORD" >> "$GITHUB_ENV"
           fi
           echo "✅ Tauri signing key prepared"
 
@@ -234,7 +273,7 @@ jobs:
           max_attempts=3
           for attempt in $(seq 1 "$max_attempts"); do
             echo "=== macOS build/notarization attempt ${attempt}/${max_attempts} ==="
-            if pnpm tauri build --target universal-apple-darwin; then
+            if pnpm tauri build --target universal-apple-darwin --config "$TAURI_BUILD_CONFIG"; then
               echo "✅ macOS build/notarization succeeded"
               exit 0
             fi
@@ -257,14 +296,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:WINDOWS_RELEASE_ARCH -eq 'arm64') {
-            pnpm tauri build --target aarch64-pc-windows-msvc --bundles msi
+            pnpm tauri build --target aarch64-pc-windows-msvc --bundles msi --config $env:TAURI_BUILD_CONFIG
           } else {
-            pnpm tauri build
+            pnpm tauri build --config $env:TAURI_BUILD_CONFIG
           }
 
       - name: Build Tauri App (Linux)
         if: runner.os == 'Linux'
-        run: pnpm tauri build --bundles appimage,deb,rpm
+        run: pnpm tauri build --bundles appimage,deb,rpm --config "$TAURI_BUILD_CONFIG"
 
       - name: Prepare macOS Assets
         if: runner.os == 'macOS'
@@ -287,7 +326,7 @@ jobs:
             fi
           done
 
-          if [ -z "$TAR_GZ" ]; then
+          if [ "${TAURI_UPDATER_ENABLED:-false}" = "true" ] && [ -z "$TAR_GZ" ]; then
             echo "❌ No macOS .tar.gz updater artifact found" >&2
             exit 1
           fi
@@ -300,11 +339,15 @@ jobs:
           xcrun stapler staple "$APP_PATH"
           echo "✅ .app stapled"
 
-          # 1) Collect .tar.gz (updater artifact)
-          NEW_TAR_GZ="CC-Switch-${VERSION}-macOS.tar.gz"
-          cp "$TAR_GZ" "release-assets/$NEW_TAR_GZ"
-          [ -f "$TAR_GZ.sig" ] && cp "$TAR_GZ.sig" "release-assets/$NEW_TAR_GZ.sig" || echo ".sig for macOS not found yet"
-          echo "macOS updater artifact copied: $NEW_TAR_GZ"
+          # 1) Collect .tar.gz when updater signing is enabled
+          if [ -n "$TAR_GZ" ]; then
+            NEW_TAR_GZ="CC-Switch-${VERSION}-macOS.tar.gz"
+            cp "$TAR_GZ" "release-assets/$NEW_TAR_GZ"
+            [ -f "$TAR_GZ.sig" ] && cp "$TAR_GZ.sig" "release-assets/$NEW_TAR_GZ.sig" || echo ".sig for macOS not found yet"
+            echo "macOS updater artifact copied: $NEW_TAR_GZ"
+          else
+            echo "macOS updater artifact skipped"
+          fi
 
           # 2) Collect .app as zip
           NEW_ZIP="CC-Switch-${VERSION}-macOS.zip"
@@ -455,8 +498,6 @@ jobs:
             if (Test-Path $sigPath) {
               Copy-Item $sigPath (Join-Path release-assets ("$dest.sig"))
               Write-Host "Signature copied: $dest.sig"
-            } elseif ($isArm64) {
-              throw "Signature not found for $($msi.Name)"
             } else {
               Write-Warning "Signature not found for $($msi.Name)"
             }
@@ -628,7 +669,8 @@ jobs:
   assemble-latest-json:
     name: Assemble latest.json
     runs-on: ubuntu-22.04
-    needs: publish-release
+    needs: [publish-release, release]
+    if: needs.release.outputs.updater_enabled == 'true'
     permissions:
       contents: write
     steps:
