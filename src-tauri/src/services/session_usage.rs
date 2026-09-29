@@ -9,12 +9,12 @@
 //! ```
 
 use crate::config::get_claude_config_dir;
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::usage_stats::{
-    effective_usage_log_filter, find_model_pricing, should_skip_session_insert, DedupKey,
+    effective_usage_log_filter, find_model_pricing_for_db, should_skip_session_insert, DedupKey,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -80,7 +80,7 @@ pub(crate) struct SyncCursor {
 /// 空表回退意味着全量重导，被剪的旧条目会在下次 rollup 时再次累加进汇总，
 /// 永久放大统计。
 pub(crate) fn load_sync_cursors(db: &Database) -> Result<HashMap<String, SyncCursor>, AppError> {
-    let conn = lock_conn!(db.conn);
+    let conn = lock_logs_conn!(db.logs_conn);
     let mut stmt = conn
         .prepare(
             "SELECT file_path, last_modified, last_line_offset, last_synced_at, last_byte_offset,
@@ -454,7 +454,7 @@ fn sync_single_file(
                 );
                 let tail = read_tail_before(&mut file, file_size)?;
                 let fingerprint = claude_tail_fingerprint(&tail);
-                let conn = lock_conn!(db.conn);
+                let conn = lock_logs_conn!(db.logs_conn);
                 update_claude_sync_state_on_conn(
                     &conn,
                     &file_path_str,
@@ -625,7 +625,16 @@ fn sync_single_file(
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
 
-    let conn = lock_conn!(db.conn);
+    // Pricing is configuration data. Load it before taking the log-database lock
+    // so a request never holds both database locks at once.
+    let mut pricing_cache = HashMap::new();
+    for msg in messages.values() {
+        pricing_cache
+            .entry(msg.model.clone())
+            .or_insert_with(|| find_model_pricing_for_db(db, &msg.model));
+    }
+
+    let conn = lock_logs_conn!(db.logs_conn);
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| AppError::Database(format!("启动会话用量导入事务失败: {e}")))?;
@@ -657,7 +666,14 @@ fn sync_single_file(
             msg.message_id
         );
 
-        match insert_session_log_entry_on_conn(&tx, &request_id, msg) {
+        match insert_session_log_entry_on_conn(
+            &tx,
+            &request_id,
+            msg,
+            pricing_cache
+                .get(&msg.model)
+                .and_then(|pricing| pricing.as_ref()),
+        ) {
             Ok(true) => imported += 1,
             Ok(false) => skipped += 1,
             Err(e) => {
@@ -736,7 +752,7 @@ fn update_claude_sync_state_on_conn(
 /// 断言游标状态用。
 #[cfg(test)]
 pub(crate) fn get_sync_state(db: &Database, file_path: &str) -> Result<(i64, i64), AppError> {
-    let conn = lock_conn!(db.conn);
+    let conn = lock_logs_conn!(db.logs_conn);
     let result = conn.query_row(
         "SELECT last_modified, last_line_offset FROM session_log_sync WHERE file_path = ?1",
         rusqlite::params![file_path],
@@ -767,7 +783,7 @@ pub(crate) fn update_sync_state(
     last_modified: i64,
     last_offset: i64,
 ) -> Result<(), AppError> {
-    let conn = lock_conn!(db.conn);
+    let conn = lock_logs_conn!(db.logs_conn);
     update_sync_state_on_conn(&conn, file_path, last_modified, last_offset)
 }
 
@@ -800,6 +816,7 @@ fn insert_session_log_entry_on_conn(
     conn: &rusqlite::Connection,
     request_id: &str,
     msg: &ParsedAssistantUsage,
+    pricing: Option<&ModelPricing>,
 ) -> Result<bool, AppError> {
     let created_at = msg
         .timestamp
@@ -839,7 +856,6 @@ fn insert_session_log_entry_on_conn(
         message_id: None,
     };
 
-    let pricing = find_model_pricing_for_session(conn, &msg.model);
     let multiplier = Decimal::from(1);
     let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) = match pricing
     {
@@ -903,17 +919,9 @@ fn insert_session_log_entry_on_conn(
     Ok(inserted_rows > 0)
 }
 
-/// 从 model_pricing 表查找模型定价（支持模糊匹配）
-fn find_model_pricing_for_session(
-    conn: &rusqlite::Connection,
-    model_id: &str,
-) -> Option<ModelPricing> {
-    find_model_pricing(conn, model_id)
-}
-
 /// 查询数据来源分布统计
 pub fn get_data_source_breakdown(db: &Database) -> Result<Vec<DataSourceSummary>, AppError> {
-    let conn = lock_conn!(db.conn);
+    let conn = lock_logs_conn!(db.logs_conn);
 
     let effective_filter = effective_usage_log_filter("l");
     let sql = format!(
@@ -1049,7 +1057,7 @@ mod tests {
     fn test_insert_claude_session_skips_matching_proxy_log() -> Result<(), AppError> {
         let db = Database::memory()?;
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,
@@ -1088,12 +1096,12 @@ mod tests {
         };
 
         let inserted = {
-            let conn = lock_conn!(db.conn);
-            insert_session_log_entry_on_conn(&conn, "session:msg_1", &msg)?
+            let conn = lock_logs_conn!(db.logs_conn);
+            insert_session_log_entry_on_conn(&conn, "session:msg_1", &msg, None)?
         };
         assert!(!inserted);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
             row.get(0)
         })?;
@@ -1288,7 +1296,7 @@ mod tests {
         let second = sync_with_cursor(&db, &file)?;
         assert_eq!(second.imported, 1, "补全后的行必须被导入，不得因游标丢失");
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM proxy_request_logs WHERE request_id = 'session:msg_partial')",
             [],
@@ -1326,7 +1334,7 @@ mod tests {
 
         // 模拟 rollup 剪掉明细
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute("DELETE FROM proxy_request_logs", [])?;
         }
 
@@ -1346,7 +1354,7 @@ mod tests {
         let size = fs::metadata(&file).unwrap().len() as i64;
         assert_eq!(byte_cursor(&db, &file), Some(size), "游标钉在当前 EOF");
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             let rows: i64 =
                 conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |r| r.get(0))?;
             assert_eq!(rows, 0, "已剪明细不得被重导");
@@ -1398,7 +1406,7 @@ mod tests {
             "永久跳过必须上报，不得静默成功"
         );
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             let msg_x_rows: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = ?1",
                 rusqlite::params![format!(
@@ -1448,7 +1456,7 @@ mod tests {
 
         // 旧版本游标：行号=1（msg_a 旧代码导入过、明细已剪），无字节游标，mtime 旧值
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO session_log_sync (file_path, last_modified, last_line_offset, last_synced_at)
                  VALUES (?1, 1, 1, 1)",
@@ -1462,7 +1470,7 @@ mod tests {
             (1, 0),
             "只导入行号游标之后的 msg_b，已剪的 msg_a 不重导"
         );
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let msg_a_rows: i64 = conn.query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = ?1",
             rusqlite::params![format!(
@@ -1492,7 +1500,7 @@ mod tests {
 
         fs::write(&file, format!("{}\n", assistant_line("msg_a", 5))).unwrap();
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO session_log_sync (file_path, last_modified, last_line_offset, last_synced_at)
                  VALUES (?1, 1, 5, 1)",
@@ -1531,7 +1539,7 @@ mod tests {
             "有 cache 成本但无 stop_reason 的 message 必须被导入"
         );
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let cache_read: i64 = conn.query_row(
             "SELECT cache_read_tokens FROM proxy_request_logs WHERE request_id = 'session:msg_nostop'",
             [],

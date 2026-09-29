@@ -186,29 +186,23 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                         for l in line.lines() {
                             if let Some(data) = strip_sse_field(l, "data") {
                                 if data.trim() == "[DONE]" {
-                                    log::debug!("[Claude/OpenRouter] <<< OpenAI SSE: [DONE]");
-
                                     // 流正常结束，发出缓存的 message_delta（含完整 usage）。
                                     if let Some((stop_reason, usage_json)) = pending_message_delta.take() {
                                         let event = build_message_delta_event(stop_reason, usage_json);
                                         let sse_data = format!("event: message_delta\ndata: {}\n\n",
                                             serde_json::to_string(&event).unwrap_or_default());
-                                        log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_delta (from pending)");
                                         yield Ok(Bytes::from(sse_data));
                                     }
 
                                     let event = json!({"type": "message_stop"});
                                     let sse_data = format!("event: message_stop\ndata: {}\n\n",
                                         serde_json::to_string(&event).unwrap_or_default());
-                                    log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_stop");
                                     yield Ok(Bytes::from(sse_data));
                                     has_sent_message_stop = true;
                                     continue;
                                 }
 
                                 if let Ok(chunk) = serde_json::from_str::<OpenAIStreamChunk>(data) {
-                                    log::debug!("[Claude/OpenRouter] <<< SSE chunk received");
-
                                     if message_id.is_none() && !chunk.id.is_empty() {
                                         message_id = Some(chunk.id.clone());
                                     }
@@ -663,7 +657,6 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                 let event = build_message_delta_event(stop_reason, usage_json);
                 let sse_data = format!("event: message_delta\ndata: {}\n\n",
                     serde_json::to_string(&event).unwrap_or_default());
-                log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_delta (at stream end)");
                 yield Ok(Bytes::from(sse_data));
                 true
             } else {
@@ -674,7 +667,6 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                 let event = json!({"type": "message_stop"});
                 let sse_data = format!("event: message_stop\ndata: {}\n\n",
                     serde_json::to_string(&event).unwrap_or_default());
-                log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_stop (at stream end)");
                 yield Ok(Bytes::from(sse_data));
             }
         }

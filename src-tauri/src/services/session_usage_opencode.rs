@@ -11,7 +11,7 @@
 //!   → proxy_request_logs 表
 //! ```
 
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::opencode_config::get_opencode_db_path;
 use crate::proxy::usage::calculator::CostCalculator;
@@ -19,7 +19,9 @@ use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
-use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
+use crate::services::usage_stats::{
+    find_model_pricing_for_db, should_skip_session_insert, DedupKey,
+};
 use rust_decimal::Decimal;
 use std::fs;
 use std::time::SystemTime;
@@ -322,7 +324,8 @@ fn insert_opencode_message(
     msg: &OpenCodeMessageData,
     session_id: &str,
 ) -> Result<bool, AppError> {
-    let conn = lock_conn!(db.conn);
+    let pricing = find_model_pricing_for_db(db, &msg.model_id);
+    let conn = lock_logs_conn!(db.logs_conn);
 
     let created_at = if msg.timestamp_ms > 0 {
         msg.timestamp_ms / 1000
@@ -373,7 +376,7 @@ fn insert_opencode_message(
                 message_id: None,
             };
 
-            match find_model_pricing(&conn, &msg.model_id) {
+            match pricing {
                 Some(pricing) => {
                     let cost = CostCalculator::calculate_for_app(
                         "opencode",

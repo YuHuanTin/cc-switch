@@ -1,6 +1,6 @@
 //! 流式健康检查日志 DAO
 
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::services::stream_check::{StreamCheckConfig, StreamCheckResult};
 
@@ -13,7 +13,7 @@ impl Database {
         app_type: &str,
         result: &StreamCheckResult,
     ) -> Result<i64, AppError> {
-        let conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
 
         conn.execute(
             "INSERT INTO stream_check_logs 
@@ -52,7 +52,7 @@ impl Database {
     /// Returns the number of deleted rows.
     pub fn cleanup_old_stream_check_logs(&self, retain_days: i64) -> Result<u64, AppError> {
         let cutoff = chrono::Utc::now().timestamp() - retain_days * 86400;
-        let conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
         let deleted = conn
             .execute(
                 "DELETE FROM stream_check_logs WHERE tested_at < ?1",

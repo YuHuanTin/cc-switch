@@ -99,7 +99,7 @@ impl<'a> UsageLogger<'a> {
 
     /// 记录成功的请求
     pub fn log_request(&self, log: &RequestLog) -> Result<(), AppError> {
-        let conn = crate::database::lock_conn!(self.db.conn);
+        let conn = crate::database::lock_logs_conn!(self.db.logs_conn);
 
         let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) =
             if let Some(cost) = &log.cost {
@@ -577,7 +577,7 @@ mod tests {
         )?;
 
         // 验证记录已插入
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let (count, request_model): (i64, String) = conn
             .query_row(
                 "SELECT COUNT(*), request_model FROM proxy_request_logs WHERE request_id = 'req-123'",
@@ -600,7 +600,7 @@ mod tests {
         logger.log_request(&log)?;
         logger.log_request(&log)?;
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = 'stable-id'",
             [],
@@ -623,7 +623,7 @@ mod tests {
         logger.log_request(&second)?;
         logger.log_request(&second)?;
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let rows: Vec<(String, i64)> = conn
             .prepare(
                 "SELECT request_id, input_tokens FROM proxy_request_logs ORDER BY input_tokens",
@@ -642,7 +642,7 @@ mod tests {
     fn only_session_log_primary_rows_may_be_replaced() -> Result<(), AppError> {
         let db = Database::memory()?;
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             for (request_id, data_source) in [
                 ("session-primary", "session_log"),
                 ("codex-primary", "codex_session"),
@@ -664,7 +664,7 @@ mod tests {
         logger.log_request(&session_replacement)?;
         logger.log_request(&request_log("codex-primary", 20))?;
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let session_source: String = conn.query_row(
             "SELECT data_source FROM proxy_request_logs WHERE request_id = 'session-primary'",
             [],
@@ -691,7 +691,7 @@ mod tests {
     fn claude_desktop_proxy_replaces_matching_session_log_row() -> Result<(), AppError> {
         let db = Database::memory()?;
         {
-            let conn = crate::database::lock_conn!(db.conn);
+            let conn = crate::database::lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, input_tokens,
@@ -725,7 +725,7 @@ mod tests {
 
         UsageLogger::new(&db).log_request(&proxy_log)?;
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let (count, source, app_type): (i64, String, String) = conn.query_row(
             "SELECT COUNT(*), data_source, app_type FROM proxy_request_logs
              WHERE request_id = 'session:msg_desktop'",
@@ -754,7 +754,7 @@ mod tests {
         )?;
 
         // 验证错误记录已插入
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let (status, error): (i64, Option<String>) = conn
             .query_row(
                 "SELECT status_code, error_message FROM proxy_request_logs WHERE request_id = 'req-error'",
@@ -792,7 +792,7 @@ mod tests {
 
         logger.log_request(&log)?;
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let semantics: i64 = conn.query_row(
             "SELECT input_token_semantics FROM proxy_request_logs WHERE request_id = 'grok-semantics'",
             [],

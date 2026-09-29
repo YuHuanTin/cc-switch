@@ -100,13 +100,6 @@ pub(crate) async fn read_decoded_body(
             })??
     };
 
-    log::debug!(
-        "[{tag}] 已接收上游响应体: status={}, bytes={}, headers={}",
-        status.as_u16(),
-        raw_bytes.len(),
-        format_headers(&headers)
-    );
-
     let mut body_bytes = raw_bytes.clone();
     let mut decoded = false;
 
@@ -156,12 +149,6 @@ pub async fn handle_streaming(
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Response {
     let status = response.status();
-    log::debug!(
-        "[{}] 已接收上游流式响应: status={}, headers={}",
-        ctx.tag,
-        status.as_u16(),
-        format_headers(response.headers())
-    );
     // 检查流式响应是否被压缩（SSE 通常不压缩，如果压缩则 SSE 解析会失败）
     if let Some(encoding) = get_content_encoding(response.headers()) {
         log::warn!(
@@ -228,12 +215,6 @@ pub async fn handle_non_streaming(
     let (mut response_headers, status, body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
     strip_hop_by_hop_response_headers(&mut response_headers);
-
-    log::debug!(
-        "[{}] 上游响应体已接收: bytes={} (content omitted)",
-        ctx.tag,
-        body_bytes.len()
-    );
 
     // 解析并记录使用量。关闭 usage logging 时直接跳过，避免非流式响应整包 JSON parse。
     if usage_logging_enabled(state) {
@@ -693,8 +674,7 @@ pub fn create_logged_passthrough_stream(
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
-        let inspect_sse_events =
-            collector.is_some() || log::log_enabled!(log::Level::Debug);
+        let inspect_sse_events = collector.is_some();
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -738,12 +718,6 @@ pub fn create_logged_passthrough_stream(
 
             match chunk_result {
                 Some(Ok(bytes)) => {
-                    if is_first_chunk {
-                        log::debug!(
-                            "[{tag}] 已接收上游流式首包: bytes={}",
-                            bytes.len()
-                        );
-                    }
                     is_first_chunk = false;
                     if inspect_sse_events {
                         crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
@@ -755,24 +729,17 @@ pub fn create_logged_passthrough_stream(
                                 for line in event_text.lines() {
                                     if let Some(data) = strip_sse_field(line, "data") {
                                         if data.trim() != "[DONE]" {
-                                            let collected = match &collector {
+                                            match &collector {
                                                 Some(c) if c.should_collect(data) => {
                                                     match serde_json::from_str::<Value>(data) {
                                                         Ok(json_value) => {
                                                             c.push(json_value).await;
-                                                            true
                                                         }
-                                                        Err(_) => false,
+                                                        Err(_) => {}
                                                     }
                                                 }
-                                                _ => false,
-                                            };
-                                            log::trace!(
-                                                "[{tag}] <<< SSE data: bytes={}, usage_collected={collected} (content omitted)",
-                                                data.len()
-                                            );
-                                        } else {
-                                            log::debug!("[{tag}] <<< SSE: [DONE]");
+                                                _ => {}
+                                            }
                                         }
                                     }
                                 }
@@ -803,55 +770,6 @@ pub fn create_logged_passthrough_stream(
     }
 }
 
-fn is_safe_diagnostic_header(name: &str) -> bool {
-    matches!(
-        name,
-        "content-type"
-            | "content-encoding"
-            | "content-length"
-            | "retry-after"
-            | "cf-ray"
-            | "x-request-id"
-            | "request-id"
-            | "x-correlation-id"
-    ) || name.starts_with("x-ratelimit-")
-        || name.starts_with("ratelimit-")
-}
-
-fn bounded_header_value(value: &axum::http::HeaderValue) -> Option<String> {
-    let value = value.to_str().ok()?;
-    let mut bounded = value.chars().take(160).collect::<String>();
-    if value.chars().count() > 160 {
-        bounded.push('…');
-    }
-    Some(bounded)
-}
-
-fn format_headers(headers: &HeaderMap) -> String {
-    let mut entries = headers
-        .keys()
-        .map(|key| {
-            let name = key.as_str();
-            if !is_safe_diagnostic_header(name) {
-                return name.to_string();
-            }
-
-            let values = headers
-                .get_all(key)
-                .iter()
-                .filter_map(bounded_header_value)
-                .collect::<Vec<_>>();
-            if values.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name}={}", values.join("|"))
-            }
-        })
-        .collect::<Vec<_>>();
-    entries.sort();
-    format!("[{}]", entries.join(", "))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,25 +787,6 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use tokio::sync::RwLock;
-
-    #[test]
-    fn format_headers_keeps_only_allowlisted_diagnostic_values() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer super-secret".parse().unwrap());
-        headers.insert("set-cookie", "session=cookie-secret".parse().unwrap());
-        headers.insert("retry-after", "30".parse().unwrap());
-        headers.insert("x-ratelimit-remaining", "2".parse().unwrap());
-        headers.insert("cf-ray", "abc123-SJC".parse().unwrap());
-
-        let formatted = format_headers(&headers);
-        assert!(formatted.contains("authorization"), "{formatted}");
-        assert!(formatted.contains("set-cookie"), "{formatted}");
-        assert!(formatted.contains("retry-after=30"), "{formatted}");
-        assert!(formatted.contains("x-ratelimit-remaining=2"), "{formatted}");
-        assert!(formatted.contains("cf-ray=abc123-SJC"), "{formatted}");
-        assert!(!formatted.contains("super-secret"), "{formatted}");
-        assert!(!formatted.contains("cookie-secret"), "{formatted}");
-    }
 
     #[tokio::test]
     async fn read_decoded_body_rejects_compressed_bomb_without_full_expansion() {
@@ -1110,7 +1009,7 @@ mod tests {
         )
         .await;
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let (model, request_model, total_cost, cost_multiplier): (String, String, String, String) =
             conn.query_row(
                 "SELECT model, request_model, total_cost_usd, cost_multiplier
@@ -1180,7 +1079,7 @@ mod tests {
         )
         .await;
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let (model, request_model, total_cost): (String, String, String) = conn
             .query_row(
                 "SELECT model, request_model, total_cost_usd
@@ -1260,7 +1159,7 @@ mod tests {
         )
         .await;
 
-        let conn = crate::database::lock_conn!(db.conn);
+        let conn = crate::database::lock_logs_conn!(db.logs_conn);
         let (total_cost, cost_multiplier): (String, String) = conn
             .query_row(
                 "SELECT total_cost_usd, cost_multiplier

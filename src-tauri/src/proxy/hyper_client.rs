@@ -4,13 +4,13 @@
 //! Supports HTTP CONNECT tunneling through upstream proxies.
 //! Falls back to hyper-util Client (title-case headers) when raw write is not feasible.
 
-use super::ProxyError;
+use super::{http_capture::HttpCapture, ProxyError};
 use bytes::Bytes;
 use futures::{stream::Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Our own header case map: maps lowercase header name → original wire-casing bytes.
 ///
@@ -83,6 +83,10 @@ pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 pub enum ProxyResponse {
     Hyper(hyper::Response<hyper::body::Incoming>),
     Reqwest(reqwest::Response),
+    Captured {
+        response: Box<ProxyResponse>,
+        capture: Arc<HttpCapture>,
+    },
     Buffered {
         status: http::StatusCode,
         headers: http::HeaderMap,
@@ -96,6 +100,14 @@ pub enum ProxyResponse {
 }
 
 impl ProxyResponse {
+    pub fn captured(response: Self, capture: Arc<HttpCapture>) -> Self {
+        capture.begin_response(response.status(), response.headers());
+        Self::Captured {
+            response: Box::new(response),
+            capture,
+        }
+    }
+
     pub fn buffered(status: http::StatusCode, headers: http::HeaderMap, body: Bytes) -> Self {
         Self::Buffered {
             status,
@@ -120,6 +132,7 @@ impl ProxyResponse {
         match self {
             Self::Hyper(r) => r.status(),
             Self::Reqwest(r) => r.status(),
+            Self::Captured { response, .. } => response.status(),
             Self::Buffered { status, .. } | Self::Streamed { status, .. } => *status,
         }
     }
@@ -128,6 +141,7 @@ impl ProxyResponse {
         match self {
             Self::Hyper(r) => r.headers(),
             Self::Reqwest(r) => r.headers(),
+            Self::Captured { response, .. } => response.headers(),
             Self::Buffered { headers, .. } | Self::Streamed { headers, .. } => headers,
         }
     }
@@ -168,6 +182,33 @@ impl ProxyResponse {
     /// 而不是先收满再比较——否则超大明文 body 仍会完整进入内存，限制形同虚设。
     pub async fn bytes_with_limit(self, max_bytes: usize) -> Result<Bytes, ProxyError> {
         match self {
+            Self::Captured { response, capture } => {
+                let mut stream = Box::pin(response.bytes_stream());
+                let mut body = bytes::BytesMut::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let proxy_error = ProxyError::ForwardFailed(format!(
+                                "Failed to read response body: {error}"
+                            ));
+                            capture.finish_with_error(&proxy_error.to_string());
+                            return Err(proxy_error);
+                        }
+                    };
+                    capture.append_response_body(&chunk);
+                    if body.len() + chunk.len() > max_bytes {
+                        let proxy_error =
+                            ProxyError::ResponseBodyTooLarge(body.len() + chunk.len());
+                        capture.finish_with_error(&proxy_error.to_string());
+                        return Err(proxy_error);
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+
+                capture.finish();
+                Ok(body.freeze())
+            }
             Self::Buffered { body, .. } => {
                 // 调用方已把 body 完整缓冲，无法中途截停，只能事后比较
                 if body.len() > max_bytes {
@@ -229,6 +270,20 @@ impl ProxyResponse {
                     .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
                 Box::pin(stream)
             }
+            Self::Captured { response, capture } => {
+                let mut stream = Box::pin(response.bytes_stream());
+                Box::pin(async_stream::stream! {
+                    while let Some(item) = stream.next().await {
+                        match &item {
+                            Ok(bytes) => capture.append_response_body(bytes),
+                            Err(error) => capture.finish_with_error(&error.to_string()),
+                        }
+                        yield item;
+                    }
+                    capture.finish();
+                })
+                    as std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>
+            }
             Self::Buffered { body, .. } => Box::pin(futures::stream::once(async move { Ok(body) }))
                 as std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
             Self::Streamed { stream, .. } => stream,
@@ -252,12 +307,9 @@ impl ProxyResponse {
 /// When set, the raw write path uses HTTP CONNECT tunneling through the proxy,
 /// so header-case preservation works even when an upstream proxy is configured.
 ///
-/// `log_display` is a caller-supplied, already-sanitized string used only for
-/// logging; this layer never derives a log value from the raw `uri`.
 #[allow(clippy::too_many_arguments)]
 pub async fn send_request(
     uri: http::Uri,
-    log_display: &str,
     method: http::Method,
     headers: http::HeaderMap,
     original_extensions: http::Extensions,
@@ -267,18 +319,6 @@ pub async fn send_request(
 ) -> Result<ProxyResponse, ProxyError> {
     // Extract our own OriginalHeaderCases if available
     let original_cases = original_extensions.get::<OriginalHeaderCases>().cloned();
-    let has_cases = original_cases
-        .as_ref()
-        .map(|c| !c.cases.is_empty())
-        .unwrap_or(false);
-    log::debug!(
-        "[HyperClient] Sending request: target={}, header_count={}, \
-         has_host={}, has_original_cases={has_cases}, proxy={:?}",
-        log_display,
-        headers.len(),
-        headers.contains_key(http::header::HOST),
-        proxy_url.map(super::http_client::mask_url),
-    );
 
     if let Some(original_cases) = original_cases
         .as_ref()

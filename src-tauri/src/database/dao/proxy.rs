@@ -8,7 +8,7 @@ use crate::error::AppError;
 use crate::proxy::types::*;
 use rust_decimal::Decimal;
 
-use super::super::{lock_conn, Database};
+use super::super::{lock_conn, lock_logs_conn, Database};
 
 pub(crate) const PRICING_SOURCE_RESPONSE: &str = "response";
 pub(crate) const PRICING_SOURCE_REQUEST: &str = "request";
@@ -533,7 +533,7 @@ impl Database {
         app_type: &str,
     ) -> Result<ProviderHealth, AppError> {
         let result = {
-            let conn = lock_conn!(self.conn);
+            let conn = lock_logs_conn!(self.logs_conn);
 
             conn.query_row(
                 "SELECT provider_id, app_type, is_healthy, consecutive_failures,
@@ -600,7 +600,7 @@ impl Database {
         error_msg: Option<String>,
         failure_threshold: u32,
     ) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
 
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -662,7 +662,7 @@ impl Database {
         provider_id: &str,
         app_type: &str,
     ) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
 
         conn.execute(
             "DELETE FROM provider_health WHERE provider_id = ?1 AND app_type = ?2",
@@ -677,7 +677,7 @@ impl Database {
 
     /// 清空指定应用的健康状态（关闭单个代理时使用）
     pub async fn clear_provider_health_for_app(&self, app_type: &str) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
 
         conn.execute(
             "DELETE FROM provider_health WHERE app_type = ?1",
@@ -691,7 +691,7 @@ impl Database {
 
     /// 清空所有Provider健康状态（代理停止时调用）
     pub async fn clear_all_provider_health(&self) -> Result<(), AppError> {
-        let conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
 
         conn.execute("DELETE FROM provider_health", [])
             .map_err(|e| AppError::Database(e.to_string()))?;

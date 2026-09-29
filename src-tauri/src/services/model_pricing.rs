@@ -678,7 +678,7 @@ mod tests {
         with_test_home(|db, _path| {
             get_models_dev_sync_state(db).expect("create override file");
             {
-                let conn = db.conn.lock().expect("lock test database");
+                let conn = db.logs_conn.lock().expect("lock test database");
                 conn.execute(
                     "INSERT INTO proxy_request_logs (
                         request_id, provider_id, app_type, model, request_model,
@@ -709,7 +709,9 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("query tombstoned pricing");
-            let total_cost: f64 = conn
+            drop(conn);
+            let logs_conn = db.logs_conn.lock().expect("lock test database");
+            let total_cost: f64 = logs_conn
                 .query_row(
                     "SELECT CAST(total_cost_usd AS REAL)
                      FROM proxy_request_logs WHERE request_id = 'pending-cost'",

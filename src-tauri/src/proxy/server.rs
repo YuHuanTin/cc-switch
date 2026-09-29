@@ -725,7 +725,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
                     let totals = {
-                        let conn = crate::database::lock_conn!(db.conn);
+                        let conn = crate::database::lock_logs_conn!(db.logs_conn);
                         match conn.query_row(
                             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
                              FROM proxy_request_logs WHERE provider_id = ?1",
@@ -936,7 +936,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
                     let totals = {
-                        let conn = crate::database::lock_conn!(db.conn);
+                        let conn = crate::database::lock_logs_conn!(db.logs_conn);
                         match conn.query_row(
                             "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
                              FROM proxy_request_logs WHERE provider_id = ?1",

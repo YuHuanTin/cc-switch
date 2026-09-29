@@ -1,9 +1,9 @@
 //! Import MCode's committed token-usage projection without modifying its database.
-use crate::database::{lock_conn, Database};
+use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::{calculator::CostCalculator, parser::TokenUsage};
 use crate::services::sql_helpers::INPUT_TOKEN_SEMANTICS_FRESH;
-use crate::services::{session_usage::SessionSyncResult, usage_stats::find_model_pricing};
+use crate::services::{session_usage::SessionSyncResult, usage_stats::find_model_pricing_for_db};
 use crate::session_manager::providers::mcode;
 use rusqlite::params;
 use rust_decimal::Decimal;
@@ -23,7 +23,7 @@ fn sync_from_database(
     key: &str,
 ) -> Result<SessionSyncResult, AppError> {
     let mut result = SessionSyncResult::default();
-    let mut conn = lock_conn!(db.conn);
+    let mut conn = lock_logs_conn!(db.logs_conn);
     let tx = conn.transaction()?;
     let mut cursor = tx.query_row(
         "SELECT COALESCE(MAX(last_line_offset), 0) FROM session_log_sync WHERE file_path = ?1",
@@ -55,7 +55,7 @@ fn sync_from_database(
         let native_cost: Option<f64> = row.get(9)?;
         let cost = match native_cost {
             Some(cost) if cost.is_finite() && cost >= 0.0 => cost.to_string(),
-            _ => find_model_pricing(&tx, model)
+            _ => find_model_pricing_for_db(db, model)
                 .map(|pricing| {
                     CostCalculator::calculate_for_app("mcode", &usage, &pricing, Decimal::ONE)
                         .total_cost
@@ -116,7 +116,7 @@ mod tests {
                 .imported,
             2
         );
-        let conn = db.conn.lock().unwrap();
+        let conn = db.logs_conn.lock().unwrap();
         let mut query = conn.prepare("SELECT model, SUM(CAST(total_cost_usd AS REAL)) FROM proxy_request_logs GROUP BY model ORDER BY model").unwrap();
         let costs = query
             .query_map([], |row| {
@@ -146,7 +146,7 @@ mod tests {
             1
         );
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.logs_conn.lock().unwrap();
             let values=conn.query_row("SELECT input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,total_cost_usd FROM proxy_request_logs WHERE app_type='mcode'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?))).unwrap();
             assert_eq!(values, (10, 23, 40, 5, "0".into()));
             let semantics: i64 = conn
@@ -197,7 +197,7 @@ mod native_validation {
         assert_eq!(sync_mcode_usage(&db)?.imported, 0);
         let native = mcode::open_database()?;
         let expected=native.query_row("SELECT SUM(input_tokens), SUM(output_tokens + reasoning_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens) FROM local_runtime_token_usage",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?)))?;
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let actual=conn.query_row("SELECT SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_creation_tokens) FROM proxy_request_logs WHERE app_type='mcode'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?)))?;
         assert_eq!(actual, expected);
         Ok(())
