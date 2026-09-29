@@ -14,7 +14,7 @@ mod forwarder;
 pub mod gemini_url;
 pub mod handler_config;
 pub mod handler_context;
-mod handlers;
+pub(crate) mod handlers;
 pub(crate) mod http_capture;
 pub mod http_client;
 pub mod hyper_client;

@@ -8,7 +8,7 @@ use super::{
     content_encoding::{decompress_body_with_limit, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
-    http_capture::HttpCapture,
+    http_capture::{HttpCapture, SseAggregator},
     json_canonical::{canonicalize_value, short_value_hash},
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
@@ -2309,8 +2309,20 @@ impl RequestForwarder {
         };
 
         let tag = adapter.name();
+        let sse_aggregator = capture_sse_aggregator(
+            adapter.name(),
+            resolved_claude_api_format.as_deref(),
+            codex_responses_to_chat,
+            codex_responses_to_anthropic,
+        );
         let capture = if log::log_enabled!(log::Level::Debug) {
-            match HttpCapture::start(method, &url, &ordered_headers, &body_bytes) {
+            match HttpCapture::start(
+                method,
+                &url,
+                &ordered_headers,
+                &body_bytes,
+                sse_aggregator,
+            ) {
                 Ok(capture) => Some(Arc::new(capture)),
                 Err(error) => {
                     log::warn!("[HttpCapture] 创建 capture.http 记录失败: {error}");
@@ -3518,6 +3530,25 @@ fn should_preserve_exact_header_case(
     }
 
     matches!(resolved_claude_api_format, None | Some("anthropic"))
+}
+
+fn capture_sse_aggregator(
+    adapter_name: &str,
+    claude_api_format: Option<&str>,
+    codex_responses_to_chat: bool,
+    codex_responses_to_anthropic: bool,
+) -> Option<SseAggregator> {
+    if codex_responses_to_anthropic || claude_api_format == Some("anthropic") {
+        Some(
+            super::providers::transform_codex_anthropic::anthropic_sse_to_message_value,
+        )
+    } else if codex_responses_to_chat || claude_api_format == Some("openai_chat") {
+        Some(super::handlers::chat_sse_to_response_value)
+    } else if claude_api_format == Some("openai_responses") || adapter_name == "Codex" {
+        Some(super::handlers::responses_sse_to_response_value)
+    } else {
+        None
+    }
 }
 
 fn is_streaming_request(endpoint: &str, body: &Value, headers: &axum::http::HeaderMap) -> bool {

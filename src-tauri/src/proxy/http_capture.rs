@@ -2,14 +2,18 @@
 //!
 //! Captures are assembled in memory and appended as one record when the
 //! response finishes. This keeps concurrent requests from interleaving in
-//! capture.http; only the terminal response.completed SSE event is kept.
+//! capture.http. SSE responses use the selected existing protocol aggregator;
+//! raw event/delta lines are never written.
 
 use http::{HeaderMap, Method, StatusCode};
+use serde_json::Value;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{fs::OpenOptions, io::Write, path::PathBuf};
 use uuid::Uuid;
 
 static CAPTURE_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) type SseAggregator = fn(&str) -> Result<Value, crate::proxy::ProxyError>;
 
 #[derive(Clone)]
 pub(crate) struct HttpCapture {
@@ -26,82 +30,12 @@ struct HttpCaptureInner {
 #[derive(Default)]
 struct CaptureState {
     data: Vec<u8>,
-    body_filter: ResponseBodyFilter,
+    response_body: Vec<u8>,
+    sse_aggregator: Option<SseAggregator>,
+    response_is_sse: bool,
     response_started: bool,
     response_status: Option<StatusCode>,
     finished: bool,
-}
-
-#[derive(Default)]
-struct ResponseBodyFilter {
-    mode: ResponseBodyFilterMode,
-}
-
-#[derive(Default)]
-enum ResponseBodyFilterMode {
-    #[default]
-    Raw,
-    Sse(SseCaptureFilter),
-}
-
-#[derive(Default)]
-struct SseCaptureFilter {
-    pending: Vec<u8>,
-}
-
-impl ResponseBodyFilter {
-    fn configure(&mut self, headers: &HeaderMap) {
-        let is_sse = headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-
-        self.mode = if is_sse {
-            ResponseBodyFilterMode::Sse(SseCaptureFilter::default())
-        } else {
-            ResponseBodyFilterMode::Raw
-        };
-    }
-
-    fn append(&mut self, data: &[u8]) -> Vec<u8> {
-        match &mut self.mode {
-            ResponseBodyFilterMode::Raw => data.to_vec(),
-            ResponseBodyFilterMode::Sse(filter) => filter.append(data),
-        }
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        match &mut self.mode {
-            ResponseBodyFilterMode::Raw => Vec::new(),
-            ResponseBodyFilterMode::Sse(filter) => filter.finish(),
-        }
-    }
-}
-
-impl SseCaptureFilter {
-    fn append(&mut self, data: &[u8]) -> Vec<u8> {
-        self.pending.extend_from_slice(data);
-        let mut output = Vec::new();
-
-        while let Some((event_end, next_event)) = find_sse_event(&self.pending) {
-            if is_response_completed_event(&self.pending[..event_end]) {
-                output.extend_from_slice(&self.pending[..next_event]);
-            }
-            self.pending.drain(..next_event);
-        }
-
-        output
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        let pending = std::mem::take(&mut self.pending);
-        if is_response_completed_event(&pending) {
-            pending
-        } else {
-            Vec::new()
-        }
-    }
 }
 
 impl HttpCapture {
@@ -110,6 +44,7 @@ impl HttpCapture {
         url: &str,
         headers: &HeaderMap,
         body: &[u8],
+        sse_aggregator: Option<SseAggregator>,
     ) -> std::io::Result<Self> {
         let log_dir = crate::panic_hook::get_log_dir();
         std::fs::create_dir_all(&log_dir)?;
@@ -121,7 +56,10 @@ impl HttpCapture {
             id,
             timestamp,
             path,
-            state: Mutex::new(CaptureState::default()),
+            state: Mutex::new(CaptureState {
+                sse_aggregator,
+                ..CaptureState::default()
+            }),
         });
         let capture = Self { inner };
 
@@ -170,7 +108,11 @@ impl HttpCapture {
 
         state.response_started = true;
         state.response_status = Some(status);
-        state.body_filter.configure(headers);
+        state.response_is_sse = headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
 
         append_text(&mut state.data, "HTTP/1.1 ");
         append_text(&mut state.data, &status.as_u16().to_string());
@@ -196,8 +138,7 @@ impl HttpCapture {
             return;
         }
 
-        let captured = state.body_filter.append(body);
-        state.data.extend_from_slice(&captured);
+        state.response_body.extend_from_slice(body);
     }
 
     pub(crate) fn finish(&self) {
@@ -222,11 +163,20 @@ impl HttpCapture {
         }
 
         state.finished = true;
-        let trailing_body = state.body_filter.finish();
-        state.data.extend_from_slice(&trailing_body);
+        let response_body = std::mem::take(&mut state.response_body);
+        let response_is_sse = state.response_is_sse;
+        let sse_aggregator = state.sse_aggregator;
         let status = state.response_status;
         let mut record = std::mem::take(&mut state.data);
         drop(state);
+
+        append_response_body(
+            &mut record,
+            &response_body,
+            response_is_sse,
+            sse_aggregator,
+            &self.inner.id,
+        );
 
         append_text(&mut record, "\r\n----- HTTP CAPTURE END ");
         append_text(&mut record, result);
@@ -264,11 +214,19 @@ impl Drop for HttpCaptureInner {
         }
 
         state.finished = true;
-        let trailing_body = state.body_filter.finish();
-        state.data.extend_from_slice(&trailing_body);
+        let response_body = std::mem::take(&mut state.response_body);
+        let response_is_sse = state.response_is_sse;
+        let sse_aggregator = state.sse_aggregator;
         let status = state.response_status;
 
         let mut record = std::mem::take(&mut state.data);
+        append_response_body(
+            &mut record,
+            &response_body,
+            response_is_sse,
+            sse_aggregator,
+            &self.id,
+        );
         append_text(
             &mut record,
             "\r\n----- HTTP CAPTURE END incomplete -----\r\n",
@@ -326,69 +284,41 @@ fn append_headers(output: &mut Vec<u8>, headers: &HeaderMap) {
     }
 }
 
-fn find_sse_event(buffer: &[u8]) -> Option<(usize, usize)> {
-    let mut line_start = 0;
-    let mut index = 0;
-
-    while index < buffer.len() {
-        let line_break_len = match buffer[index] {
-            b'\r' if buffer.get(index + 1) == Some(&b'\n') => 2,
-            b'\r' if buffer.get(index + 1).is_none() => return None,
-            b'\r' | b'\n' => 1,
-            _ => {
-                index += 1;
-                continue;
-            }
-        };
-
-        if line_start == index {
-            return Some((index, index + line_break_len));
-        }
-
-        line_start = index + line_break_len;
-        index = line_start;
+fn append_response_body(
+    record: &mut Vec<u8>,
+    body: &[u8],
+    is_sse: bool,
+    sse_aggregator: Option<SseAggregator>,
+    capture_id: &str,
+) {
+    if !is_sse {
+        record.extend_from_slice(body);
+        return;
     }
 
-    None
-}
-
-fn is_response_completed_event(block: &[u8]) -> bool {
-    let Ok(block) = std::str::from_utf8(block) else {
-        return false;
+    let Some(sse_aggregator) = sse_aggregator else {
+        append_aggregation_error(record, capture_id, "no SSE aggregator configured");
+        return;
     };
-
-    let mut data_lines = Vec::new();
-    for line in block.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(event) = sse_field(line, "event") {
-            if event.trim() == "response.completed" {
-                return true;
-            }
-        }
-        if let Some(data) = sse_field(line, "data") {
-            data_lines.push(data);
-        }
+    let body = String::from_utf8_lossy(body);
+    match sse_aggregator(&body) {
+        Ok(response) => match serde_json::to_vec(&response) {
+            Ok(response) => record.extend_from_slice(&response),
+            Err(error) => append_aggregation_error(record, capture_id, &error.to_string()),
+        },
+        Err(error) => append_aggregation_error(record, capture_id, &error.to_string()),
     }
-
-    if data_lines.is_empty() {
-        return false;
-    }
-
-    let data = data_lines.join("\n");
-    serde_json::from_str::<serde_json::Value>(&data)
-        .ok()
-        .is_some_and(|value| {
-            value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|event_type| event_type == "response.completed")
-        })
 }
 
-fn sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
-    line.strip_prefix(field)
-        .and_then(|value| value.strip_prefix(':'))
-        .map(|value| value.strip_prefix(' ').unwrap_or(value))
+fn append_aggregation_error(record: &mut Vec<u8>, capture_id: &str, error: &str) {
+    log::warn!(
+        "[HttpCapture] id={} SSE 最终响应聚合失败: {}",
+        capture_id,
+        single_line(error)
+    );
+    append_text(record, "[SSE response aggregation failed: ");
+    append_text(record, &single_line(error));
+    append_text(record, "]");
 }
 
 fn append_request_headers(output: &mut Vec<u8>, url: &str, headers: &HeaderMap, body_len: usize) {
@@ -416,98 +346,5 @@ fn append_request_headers(output: &mut Vec<u8>, url: &str, headers: &HeaderMap, 
         output.extend_from_slice(b"content-length: ");
         output.extend_from_slice(body_len.to_string().as_bytes());
         output.extend_from_slice(b"\r\n");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ResponseBodyFilter, ResponseBodyFilterMode};
-
-    fn sse_filter() -> ResponseBodyFilter {
-        ResponseBodyFilter {
-            mode: ResponseBodyFilterMode::Sse(Default::default()),
-        }
-    }
-
-    #[test]
-    fn keeps_only_response_completed_events() {
-        let mut filter = sse_filter();
-        let input = concat!(
-            "event: response.output_text.delta\n",
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"large text\"}\n\n",
-            "event: response.custom_tool_call_input.delta\n",
-            "data: {\"type\":\"response.custom_tool_call_input.delta\",\"delta\":\"large tool input\"}\n\n",
-            "event: response.output_text.done\n",
-            "data: {\"type\":\"response.output_text.done\",\"text\":\"large text\"}\n\n",
-            "event: response.failed\n",
-            "data: {\"type\":\"response.failed\",\"error\":{}}\n\n",
-            "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
-        );
-
-        let output = filter.append(input.as_bytes());
-        let output = String::from_utf8_lossy(&output);
-        assert!(!output.contains("output_text.delta"));
-        assert!(!output.contains("custom_tool_call_input.delta"));
-        assert!(!output.contains("output_text.done"));
-        assert!(!output.contains("response.failed"));
-        assert!(output.contains("response.completed"));
-    }
-
-    #[test]
-    fn separate_clients_keep_sse_partial_events_isolated() {
-        let mut client_a = sse_filter();
-        let mut client_b = sse_filter();
-
-        let a_first = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":";
-        let b_first = b"event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":";
-        let a_second = b"\"client-a\"}\n\n";
-        let b_second = b"\"client-b\"}\n\n";
-
-        assert!(client_a.append(a_first).is_empty());
-        assert!(client_b.append(b_first).is_empty());
-
-        let a_output = client_a.append(a_second);
-        let b_output = client_b.append(b_second);
-
-        assert!(String::from_utf8_lossy(&a_output).is_empty());
-        assert!(String::from_utf8_lossy(&b_output).is_empty());
-        assert!(String::from_utf8_lossy(&client_a.finish()).is_empty());
-        assert!(String::from_utf8_lossy(&client_b.finish()).is_empty());
-    }
-
-    #[test]
-    fn filters_data_type_without_event_field_and_preserves_utf8_terminal_data() {
-        let mut filter = sse_filter();
-        let delta = concat!("data: {\"type\":\"response.output_text.delta\",\"delta\":\"你\"}\n\n");
-        let terminal = "data: {\"type\":\"response.completed\",\"text\":\"你好\"}\n\n";
-
-        let mut output = filter.append(&delta.as_bytes()[..delta.len() - 1]);
-        output.extend_from_slice(&filter.append(&delta.as_bytes()[delta.len() - 1..]));
-        output.extend_from_slice(&filter.append(terminal.as_bytes()));
-
-        let output = String::from_utf8(output).expect("terminal SSE remains valid UTF-8");
-        assert!(!output.contains("output_text.delta"));
-        assert!(output.contains("你好"));
-    }
-
-    #[test]
-    fn parses_crlf_multiline_data_and_drops_unfinished_events() {
-        let mut filter = sse_filter();
-        let first = b"event: response.completed\r\ndata: {\r\ndata: \"type\":\"response.completed\",\r\ndata: \"text\":\"done\"}\r\n\r\n";
-        let second = b"event: response.output_text.done\r\ndata: {\"type\":\"response.output_text.done\"}\r\n\r\n";
-
-        let output = filter.append(&first[..17]);
-        assert!(output.is_empty());
-        let mut output = filter.append(&first[17..]);
-        output.extend_from_slice(&filter.append(second));
-
-        let output = String::from_utf8(output).expect("completed SSE remains UTF-8");
-        assert!(output.contains("response.completed"));
-        assert!(!output.contains("response.output_text.done"));
-
-        let unfinished = b"event: response.completed\ndata: {\"type\":\"response.completed\"}";
-        assert!(filter.append(unfinished).is_empty());
-        assert!(filter.finish().is_empty());
     }
 }
