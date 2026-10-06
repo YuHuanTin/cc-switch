@@ -1,4 +1,6 @@
-//! 流式健康检查日志 DAO
+//! 连通检测日志 DAO
+//!
+//! 连通检测已不再写日志；`stream_check_logs` 表只为兼容旧库保留，这里只负责清理残留行。
 
 use crate::database::{lock_logs_conn, Database};
 use crate::error::AppError;

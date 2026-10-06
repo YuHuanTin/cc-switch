@@ -36,10 +36,7 @@ pub(crate) use dao::providers_seed::{
     is_official_seed_id, CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, CODEX_OFFICIAL_PROVIDER_ID,
     GROKBUILD_OFFICIAL_PROVIDER_ID,
 };
-pub(crate) use dao::proxy::{
-    validate_cost_multiplier, validate_pricing_source, PRICING_SOURCE_REQUEST,
-    PRICING_SOURCE_RESPONSE,
-};
+pub(crate) use dao::proxy::{PRICING_SOURCE_REQUEST, PRICING_SOURCE_RESPONSE};
 pub use dao::FailoverQueueItem;
 pub use dao::Profile;
 
@@ -54,7 +51,7 @@ use std::sync::Mutex;
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 19;
+pub(crate) const SCHEMA_VERSION: i32 = 20;
 
 /// 独立日志数据库的版本号。
 ///
@@ -98,6 +95,8 @@ pub(crate) use lock_logs_conn;
 pub struct Database {
     pub(crate) conn: Mutex<Connection>,
     pub(crate) logs_conn: Mutex<Connection>,
+    /// 请求日志总数缓存，见 `services::usage_stats::LogCountCache`
+    pub(crate) log_count_cache: Mutex<Option<crate::services::usage_stats::LogCountCache>>,
 }
 
 fn register_db_change_hook(conn: &Connection) {
@@ -153,6 +152,7 @@ impl Database {
         let db = Self {
             conn: Mutex::new(conn),
             logs_conn: Mutex::new(logs_conn),
+            log_count_cache: Mutex::new(None),
         };
 
         let config_version = {
@@ -236,9 +236,15 @@ impl Database {
         }
         // Reclaim disk space after cleanup
         {
+            let conn = lock_conn!(db.conn);
+            if let Err(e) = Self::incremental_vacuum_on_conn(&conn) {
+                log::warn!("Startup config database incremental vacuum failed: {e}");
+            }
+        }
+        {
             let logs_conn = lock_logs_conn!(db.logs_conn);
-            if let Err(e) = logs_conn.execute_batch("PRAGMA incremental_vacuum;") {
-                log::warn!("Startup incremental vacuum failed: {e}");
+            if let Err(e) = Self::incremental_vacuum_on_conn(&logs_conn) {
+                log::warn!("Startup log database incremental vacuum failed: {e}");
             }
         }
 
@@ -279,6 +285,7 @@ impl Database {
         let db = Self {
             conn: Mutex::new(conn),
             logs_conn: Mutex::new(logs_conn),
+            log_count_cache: Mutex::new(None),
         };
         db.create_tables()?;
         {
@@ -458,6 +465,23 @@ impl Database {
     pub(crate) fn get_auto_vacuum_mode(conn: &Connection) -> Result<i32, AppError> {
         conn.query_row("PRAGMA auto_vacuum;", [], |row| row.get(0))
             .map_err(|e| AppError::Database(format!("读取 auto_vacuum 失败: {e}")))
+    }
+
+    /// 回收全部空闲页。`PRAGMA incremental_vacuum` 每释放一页产出一行结果，
+    /// 必须把结果读完才会回收完；`execute_batch` 只 step 一次，只能回收 1 页。
+    pub(crate) fn incremental_vacuum_on_conn(conn: &Connection) -> Result<(), AppError> {
+        let mut stmt = conn
+            .prepare("PRAGMA incremental_vacuum;")
+            .map_err(|e| AppError::Database(format!("执行 incremental_vacuum 失败: {e}")))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| AppError::Database(format!("执行 incremental_vacuum 失败: {e}")))?;
+        while rows
+            .next()
+            .map_err(|e| AppError::Database(format!("执行 incremental_vacuum 失败: {e}")))?
+            .is_some()
+        {}
+        Ok(())
     }
 
     fn has_user_tables(conn: &Connection) -> Result<bool, AppError> {

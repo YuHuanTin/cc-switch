@@ -470,9 +470,13 @@ impl Database {
             }
         }
         if reclaimed_rows > 0 {
+            let conn = lock_conn!(self.conn);
+            if let Err(e) = Self::incremental_vacuum_on_conn(&conn) {
+                log::warn!("Periodic config database incremental vacuum failed: {e}");
+            }
             let logs_conn = lock_logs_conn!(self.logs_conn);
-            if let Err(e) = logs_conn.execute_batch("PRAGMA incremental_vacuum;") {
-                log::warn!("Periodic incremental vacuum failed: {e}");
+            if let Err(e) = Self::incremental_vacuum_on_conn(&logs_conn) {
+                log::warn!("Periodic log database incremental vacuum failed: {e}");
             }
         }
 
