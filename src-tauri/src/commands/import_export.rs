@@ -146,13 +146,13 @@ pub async fn open_zip_file_dialog<R: tauri::Runtime>(
 #[tauri::command]
 pub async fn create_db_backup(state: State<'_, AppState>) -> Result<String, String> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || match db.backup_database_file()? {
+    tauri::async_runtime::spawn_blocking(move || match db.backup_logs_database_file()? {
         Some(path) => Ok(path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default()),
         None => Err(AppError::Config(
-            "Database file not found, backup skipped".to_string(),
+            "Log database file not found, backup skipped".to_string(),
         )),
     })
     .await
@@ -178,7 +178,7 @@ pub async fn restore_db_backup(
         tauri::async_runtime::spawn_blocking(move || {
             let restored = {
                 let _skill_state_guard = skill_state_write_guard();
-                db.restore_from_backup(&filename)?
+                db.restore_logs_from_backup(&filename)?
             };
             let warning =
                 post_sync_warning_from_result(Ok(run_post_import_sync(&app_state_for_sync)));

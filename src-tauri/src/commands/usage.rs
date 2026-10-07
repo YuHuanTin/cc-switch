@@ -333,7 +333,7 @@ pub async fn rebuild_codex_usage(
         .lock()
         .await;
     tauri::async_runtime::spawn_blocking(move || {
-        db.backup_database_file()?;
+        db.backup_logs_database_file()?;
         db.reset_codex_usage()?;
         let result = crate::services::session_usage_codex::sync_codex_usage(&db);
         finish_codex_rebuild(result)

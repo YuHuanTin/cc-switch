@@ -423,7 +423,7 @@ impl Database {
             let backup_file_guard = lock_backup_file_operations()?;
             let backup_dir = get_app_config_dir().join("backups");
             if !backup_dir.exists() {
-                self.backup_database_file_locked(&backup_file_guard)?;
+                self.backup_database_file_locked(&backup_file_guard, true)?;
             } else {
                 let latest = fs::read_dir(&backup_dir).ok().and_then(|entries| {
                     entries
@@ -446,7 +446,7 @@ impl Database {
                     log::info!(
                         "Periodic backup: latest backup is older than {interval_hours} hours, creating new backup"
                     );
-                    self.backup_database_file_locked(&backup_file_guard)?;
+                    self.backup_database_file_locked(&backup_file_guard, true)?;
                 }
             }
         }
@@ -486,15 +486,33 @@ impl Database {
     /// 生成一致性快照备份，返回备份文件路径（不存在主库时返回 None）
     pub(crate) fn backup_database_file(&self) -> Result<Option<PathBuf>, AppError> {
         let backup_file_guard = lock_backup_file_operations()?;
-        self.backup_database_file_locked(&backup_file_guard)
+        self.backup_database_file_locked(&backup_file_guard, false)
     }
 
     fn backup_database_file_locked(
         &self,
         backup_file_guard: &BackupFileOperationGuard,
+        logs_database: bool,
     ) -> Result<Option<PathBuf>, AppError> {
+        if logs_database {
+            let logs_conn = lock_logs_conn!(self.logs_conn);
+            return Self::backup_database_file_from_conn_with_hook(
+                backup_file_guard,
+                &logs_conn,
+                "cc-switch-logs.db",
+                &[],
+                |_, _| Ok(()),
+            );
+        }
+
         let conn = lock_conn!(self.conn);
         Self::backup_database_file_from_conn(backup_file_guard, &conn, &[])
+    }
+
+    /// Create a user-visible backup of the independent log database.
+    pub(crate) fn backup_logs_database_file(&self) -> Result<Option<PathBuf>, AppError> {
+        let backup_file_guard = lock_backup_file_operations()?;
+        self.backup_database_file_locked(&backup_file_guard, true)
     }
 
     /// Create a safety backup from a connection whose caller already owns both
@@ -507,6 +525,7 @@ impl Database {
         Self::backup_database_file_from_conn_with_hook(
             backup_file_guard,
             source_conn,
+            "cc-switch.db",
             protected_paths,
             |_, _| Ok(()),
         )
@@ -515,13 +534,14 @@ impl Database {
     fn backup_database_file_from_conn_with_hook<F>(
         _backup_file_guard: &BackupFileOperationGuard,
         source_conn: &Connection,
+        database_filename: &str,
         protected_paths: &[&Path],
         before_publish: F,
     ) -> Result<Option<PathBuf>, AppError>
     where
         F: FnOnce(&Path, &Path) -> Result<(), AppError>,
     {
-        let db_path = get_app_config_dir().join("cc-switch.db");
+        let db_path = get_app_config_dir().join(database_filename);
         if !db_path.exists() {
             return Ok(None);
         }
@@ -1012,6 +1032,66 @@ impl Database {
     /// Restore database from a backup file. Returns the safety backup ID.
     pub fn restore_from_backup(&self, filename: &str) -> Result<String, AppError> {
         self.restore_from_backup_with_hook(filename, |_| Ok(()))
+    }
+
+    pub(crate) fn restore_logs_from_backup(&self, filename: &str) -> Result<String, AppError> {
+        if filename.contains("..")
+            || filename.contains('/')
+            || filename.contains('\\')
+            || !filename.ends_with(".db")
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid log database backup filename".to_string(),
+            ));
+        }
+
+        let backup_file_guard = lock_backup_file_operations()?;
+        let backup_dir = get_app_config_dir().join("backups");
+        let backup_path = backup_dir.join(filename);
+        if !backup_path.exists() {
+            return Err(AppError::InvalidInput(format!(
+                "Backup file not found: {filename}"
+            )));
+        }
+
+        let source_conn = Connection::open_with_flags(
+            &backup_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if !Self::table_exists(&source_conn, "proxy_request_logs")?
+            || Self::table_exists(&source_conn, "providers")?
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid log database backup file".to_string(),
+            ));
+        }
+        Self::validate_sqlite_integrity(&source_conn)?;
+
+        let safety_backup = {
+            let mut logs_conn = lock_logs_conn!(self.logs_conn);
+            let safety_backup = Self::backup_database_file_from_conn_with_hook(
+                &backup_file_guard,
+                &logs_conn,
+                "cc-switch-logs.db",
+                &[backup_path.as_path()],
+                |_, _| Ok(()),
+            )?;
+            let backup = Backup::new(&source_conn, &mut logs_conn)
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            Self::complete_backup(&backup, "恢复日志数据库")?;
+            safety_backup
+        };
+
+        let safety_id = safety_backup
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        let mut count_cache = lock_conn!(self.log_count_cache);
+        *count_cache = None;
+        log::info!(
+            "Log database restored from backup: {filename}, safety backup: {safety_id}"
+        );
+        Ok(safety_id)
     }
 
     fn restore_from_backup_with_hook<F>(
@@ -2375,6 +2455,7 @@ mod tests {
             Database::backup_database_file_from_conn_with_hook(
                 &backup_file_guard,
                 &conn,
+                "cc-switch.db",
                 &[],
                 |temp_path, target_path| {
                     assert!(
@@ -2426,6 +2507,7 @@ mod tests {
             Database::backup_database_file_from_conn_with_hook(
                 &backup_file_guard,
                 &conn,
+                "cc-switch.db",
                 &[],
                 |_, target_path| {
                     claimed_path = Some(target_path.to_path_buf());
