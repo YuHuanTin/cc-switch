@@ -27,6 +27,7 @@ jobs:
         id: check
         shell: bash
         env:
+          SIGNING_ENABLED: ${{ vars.ENABLE_RELEASE_SIGNING }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
@@ -34,7 +35,8 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -n "$APPLE_CERTIFICATE" ] && \
+          if [ "$SIGNING_ENABLED" = "true" ] && \
+             [ -n "$APPLE_CERTIFICATE" ] && \
              [ -n "$APPLE_CERTIFICATE_PASSWORD" ] && \
              [ -n "$KEYCHAIN_PASSWORD" ] && \
              [ -n "$APPLE_ID" ] && \
@@ -220,6 +222,7 @@ jobs:
         id: tauri-build-config
         shell: bash
         env:
+          SIGNING_ENABLED: ${{ vars.ENABLE_RELEASE_SIGNING }}
           TAURI_PRIVATE_KEY_RAW: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
@@ -227,11 +230,11 @@ jobs:
           CONFIG_PATH="src-tauri/tauri.ci.json"
           echo "TAURI_BUILD_CONFIG=$CONFIG_PATH" >> "$GITHUB_ENV"
 
-          if [ -z "$TAURI_PRIVATE_KEY_RAW" ]; then
+          if [ "$SIGNING_ENABLED" != "true" ] || [ -z "$TAURI_PRIVATE_KEY_RAW" ]; then
             printf '%s\n' '{"bundle":{"createUpdaterArtifacts":false}}' > "$CONFIG_PATH"
             echo "TAURI_UPDATER_ENABLED=false" >> "$GITHUB_ENV"
             echo "updater_enabled=false" >> "$GITHUB_OUTPUT"
-            echo "TAURI_SIGNING_PRIVATE_KEY is not configured; updater artifacts disabled for this build"
+            echo "Release signing is off (ENABLE_RELEASE_SIGNING != true) or TAURI_SIGNING_PRIVATE_KEY is missing; updater artifacts disabled for this build"
             exit 0
           fi
 
@@ -650,22 +653,42 @@ jobs:
             fi
             echo "No AppImage found under target/release/bundle" >&2
           fi
-          # 额外上传 .deb（用于手动安装，不参与 Updater）
+          # 额外上传 .deb（用于 Debian/Ubuntu 自动更新）
           DEB=$(find src-tauri/target/release/bundle -name "*.deb" | head -1 || true)
-          if [ -n "$DEB" ]; then
-            cp "$DEB" "release-assets/CC-Switch-${VERSION}-Linux-${ARCH}.deb"
-            echo "Deb package copied: CC-Switch-${VERSION}-Linux-${ARCH}.deb"
-          else
-            echo "No .deb found (optional)"
+          if [ -z "$DEB" ]; then
+            echo "❌ No .deb found under target/release/bundle" >&2
+            exit 1
           fi
-          # 额外上传 .rpm（用于 Fedora/RHEL/openSUSE 等，不参与 Updater）
+          NEW_DEB="CC-Switch-${VERSION}-Linux-${ARCH}.deb"
+          cp "$DEB" "release-assets/$NEW_DEB"
+          if [ "${TAURI_UPDATER_ENABLED:-false}" = "true" ]; then
+            if [ ! -f "$DEB.sig" ]; then
+              echo "❌ Updater signature not found: $DEB.sig" >&2
+              exit 1
+            fi
+            cp "$DEB.sig" "release-assets/$NEW_DEB.sig"
+          elif [ -f "$DEB.sig" ]; then
+            cp "$DEB.sig" "release-assets/$NEW_DEB.sig"
+          fi
+          echo "Deb package copied: $NEW_DEB"
+          # 额外上传 .rpm（用于 Fedora/RHEL/openSUSE 等自动更新）
           RPM=$(find src-tauri/target/release/bundle -name "*.rpm" | head -1 || true)
-          if [ -n "$RPM" ]; then
-            cp "$RPM" "release-assets/CC-Switch-${VERSION}-Linux-${ARCH}.rpm"
-            echo "RPM package copied: CC-Switch-${VERSION}-Linux-${ARCH}.rpm"
-          else
-            echo "No .rpm found (optional)"
+          if [ -z "$RPM" ]; then
+            echo "❌ No .rpm found under target/release/bundle" >&2
+            exit 1
           fi
+          NEW_RPM="CC-Switch-${VERSION}-Linux-${ARCH}.rpm"
+          cp "$RPM" "release-assets/$NEW_RPM"
+          if [ "${TAURI_UPDATER_ENABLED:-false}" = "true" ]; then
+            if [ ! -f "$RPM.sig" ]; then
+              echo "❌ Updater signature not found: $RPM.sig" >&2
+              exit 1
+            fi
+            cp "$RPM.sig" "release-assets/$NEW_RPM.sig"
+          elif [ -f "$RPM.sig" ]; then
+            cp "$RPM.sig" "release-assets/$NEW_RPM.sig"
+          fi
+          echo "RPM package copied: $NEW_RPM"
 
       - name: List prepared assets
         shell: bash
@@ -795,6 +818,10 @@ jobs:
           win_arm64_url=""; win_arm64_sig=""
           linux_x64_url=""; linux_x64_sig=""
           linux_arm64_url=""; linux_arm64_sig=""
+          linux_x64_deb_url=""; linux_x64_deb_sig=""
+          linux_arm64_deb_url=""; linux_arm64_deb_sig=""
+          linux_x64_rpm_url=""; linux_x64_rpm_sig=""
+          linux_arm64_rpm_url=""; linux_arm64_rpm_sig=""
           shopt -s nullglob
           for sig in dl/*.sig; do
             base=${sig%.sig}
@@ -813,6 +840,14 @@ jobs:
                 linux_arm64_url="$url"; linux_arm64_sig="$sig_content";;
               *-Linux-x86_64.AppImage|*-Linux-x86_64.appimage)
                 linux_x64_url="$url"; linux_x64_sig="$sig_content";;
+              *-Linux-arm64.deb)
+                linux_arm64_deb_url="$url"; linux_arm64_deb_sig="$sig_content";;
+              *-Linux-x86_64.deb)
+                linux_x64_deb_url="$url"; linux_x64_deb_sig="$sig_content";;
+              *-Linux-arm64.rpm)
+                linux_arm64_rpm_url="$url"; linux_arm64_rpm_sig="$sig_content";;
+              *-Linux-x86_64.rpm)
+                linux_x64_rpm_url="$url"; linux_x64_rpm_sig="$sig_content";;
             esac
           done
           # 缺任一平台都不能发：缺的那批用户会静默收不到更新
@@ -824,6 +859,10 @@ jobs:
           [ -n "$win_arm64_sig" ] || missing="$missing windows-aarch64"
           [ -n "$linux_x64_sig" ] || missing="$missing linux-x86_64"
           [ -n "$linux_arm64_sig" ] || missing="$missing linux-aarch64"
+          [ -n "$linux_x64_deb_sig" ] || missing="$missing linux-x86_64-deb"
+          [ -n "$linux_arm64_deb_sig" ] || missing="$missing linux-aarch64-deb"
+          [ -n "$linux_x64_rpm_sig" ] || missing="$missing linux-x86_64-rpm"
+          [ -n "$linux_arm64_rpm_sig" ] || missing="$missing linux-aarch64-rpm"
           if [ -n "$missing" ]; then
             echo "❌ Missing updater signatures for:$missing" >&2
             exit 1
@@ -863,6 +902,26 @@ jobs:
             if [ -n "$linux_arm64_url" ] && [ -n "$linux_arm64_sig" ]; then
               [ $first -eq 0 ] && echo ','
               echo "    \"linux-aarch64\": {\"signature\": \"$linux_arm64_sig\", \"url\": \"$linux_arm64_url\"}"
+              first=0
+            fi
+            if [ -n "$linux_x64_deb_url" ] && [ -n "$linux_x64_deb_sig" ]; then
+              [ $first -eq 0 ] && echo ','
+              echo "    \"linux-x86_64-deb\": {\"signature\": \"$linux_x64_deb_sig\", \"url\": \"$linux_x64_deb_url\"}"
+              first=0
+            fi
+            if [ -n "$linux_arm64_deb_url" ] && [ -n "$linux_arm64_deb_sig" ]; then
+              [ $first -eq 0 ] && echo ','
+              echo "    \"linux-aarch64-deb\": {\"signature\": \"$linux_arm64_deb_sig\", \"url\": \"$linux_arm64_deb_url\"}"
+              first=0
+            fi
+            if [ -n "$linux_x64_rpm_url" ] && [ -n "$linux_x64_rpm_sig" ]; then
+              [ $first -eq 0 ] && echo ','
+              echo "    \"linux-x86_64-rpm\": {\"signature\": \"$linux_x64_rpm_sig\", \"url\": \"$linux_x64_rpm_url\"}"
+              first=0
+            fi
+            if [ -n "$linux_arm64_rpm_url" ] && [ -n "$linux_arm64_rpm_sig" ]; then
+              [ $first -eq 0 ] && echo ','
+              echo "    \"linux-aarch64-rpm\": {\"signature\": \"$linux_arm64_rpm_sig\", \"url\": \"$linux_arm64_rpm_url\"}"
               first=0
             fi
             echo '  }'
