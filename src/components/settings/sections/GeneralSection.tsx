@@ -27,6 +27,7 @@ const LANGUAGES: { value: Language; labelKey: string }[] = [
   { value: "zh-TW", labelKey: "settings.languageOptionTraditionalChinese" },
   { value: "en", labelKey: "settings.languageOptionEnglish" },
   { value: "ja", labelKey: "settings.languageOptionJapanese" },
+  { value: "tr", labelKey: "settings.languageOptionTurkish" },
 ];
 
 interface GeneralSectionProps {
@@ -95,6 +96,33 @@ export function GeneralSection({
                     value: "dark",
                     label: t("settings.themeDark"),
                     icon: Moon,
+                  },
+                ]}
+              />
+            }
+          />
+          <SettingsRow
+            label={t("settings.general.quotaDisplay")}
+            help={{
+              title: t("settings.general.quotaDisplay"),
+              body: t("settings.general.quotaDisplayHelp"),
+            }}
+            control={
+              <SegmentedControl
+                size="sm"
+                aria-label={t("settings.general.quotaDisplay")}
+                value={settings.quotaDisplay ?? "left"}
+                onValueChange={(value) =>
+                  void onAutoSave({ quotaDisplay: value })
+                }
+                items={[
+                  {
+                    value: "left",
+                    label: t("settings.general.quotaDisplayLeft"),
+                  },
+                  {
+                    value: "used",
+                    label: t("settings.general.quotaDisplayUsed"),
                   },
                 ]}
               />

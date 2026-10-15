@@ -164,6 +164,7 @@ function App() {
   const [currentView, setCurrentView] = useState<View>(readStoredView);
   const [settingsSection, setSettingsSection] =
     useState<SettingsSection>("general");
+  const [appConfigScrollTarget, setAppConfigScrollTarget] = useState<AppId>();
   // 进设置前停留的页面：设置目录里的「← 返回」回到这里
   const settingsReturnViewRef = useRef<View>("providers");
   const [openclawConfigTab, setOpenclawConfigTab] =
@@ -645,14 +646,18 @@ function App() {
     return true;
   };
 
-  const openSettings = (section: SettingsSection = "general") => {
+  const openSettings = (
+    section: SettingsSection = "general",
+    appConfigTarget?: AppId,
+  ) => {
     if (managementBusyRef.current) return;
-    if (confirmLeave(() => openSettings(section))) return;
+    if (confirmLeave(() => openSettings(section, appConfigTarget))) return;
     closeProviderPanels();
     if (currentViewRef.current !== "settings") {
       settingsReturnViewRef.current = currentViewRef.current;
     }
     setSettingsSection(section);
+    setAppConfigScrollTarget(appConfigTarget);
     setCurrentView("settings");
   };
 
@@ -675,6 +680,8 @@ function App() {
       return;
     }
     if (managementBusyRef.current) return;
+    // 再点当前页不会离开：不弹确认，也不能清掉编辑页的未保存登记
+    if (currentViewRef.current === page) return;
     if (confirmLeave(() => openPage(page))) return;
     closeProviderPanels();
     if (page === "prompts" && currentViewRef.current !== "prompts") {
@@ -1132,7 +1139,7 @@ function App() {
             {t("appPage.viewUsage")}
           </DropdownMenuItem>
         )}
-        <DropdownMenuItem onSelect={() => openSettings("appConfig")}>
+        <DropdownMenuItem onSelect={() => openSettings("appConfig", activeApp)}>
           {t("appPage.configDirectory")}
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => openPage("apps")}>
@@ -1520,6 +1527,7 @@ function App() {
       return (
         <SettingsPage
           section={settingsSection}
+          appConfigScrollTarget={appConfigScrollTarget}
           onImportSuccess={handleImportSuccess}
           onOpenApps={() => setCurrentView("apps")}
           onOpenApp={selectApp}
@@ -1541,7 +1549,10 @@ function App() {
           settingsSection={settingsSection}
           onSelectApp={selectApp}
           onSelectPage={openPageFromNav}
-          onSelectSettingsSection={setSettingsSection}
+          onSelectSettingsSection={(section) => {
+            setAppConfigScrollTarget(undefined);
+            setSettingsSection(section);
+          }}
           onExitSettings={exitSettings}
           appsUpdateAvailable={
             checkToolUpdatesOnStartup && toolUpdatesAvailable
