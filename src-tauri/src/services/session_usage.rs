@@ -9,12 +9,12 @@
 //! ```
 
 use crate::config::get_claude_config_dir;
-use crate::database::{lock_logs_conn, Database};
+use crate::database::{lock_conn, lock_logs_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::{claude_cache_creation_1h_tokens, TokenUsage};
 use crate::services::usage_stats::{
-    effective_usage_log_filter, find_model_pricing_for_db, has_matching_proxy_usage_log, DedupKey,
+    effective_usage_log_filter, find_model_pricing, has_matching_proxy_usage_log, DedupKey,
 };
 use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
@@ -845,14 +845,14 @@ fn sync_single_file(
     let mut imported: u32 = 0;
     let mut skipped: u32 = 0;
 
-    // Pricing is configuration data. Load it before taking the log-database lock
-    // so a request never holds both database locks at once.
-    let mut pricing_cache = HashMap::new();
-    for msg in messages.values() {
-        pricing_cache
-            .entry(msg.model.clone())
-            .or_insert_with(|| find_model_pricing_for_db(db, &msg.model));
-    }
+    // 定价是配置数据，日志库里没有这张表：拿日志锁之前先把快照取好，
+    // 导入事务期间只读快照，一个请求不会同时持有两把数据库锁。
+    // 快照只活到这次文件导入结束：下一文件/下一轮重新取，
+    // 期间的定价更新或新增立即可见。
+    let pricing_cache = {
+        let config_conn = lock_conn!(db.conn);
+        SessionPricingCache::snapshot(&config_conn, messages.values().map(|msg| msg.model.as_str()))
+    };
 
     let conn = lock_logs_conn!(db.logs_conn);
     let tx = conn
@@ -903,15 +903,7 @@ fn sync_single_file(
                 })
             });
 
-        match upsert_session_log_entry_on_conn(
-            &tx,
-            &request_id,
-            msg,
-            timing,
-            pricing_cache
-                .get(&msg.model)
-                .and_then(|pricing| pricing.as_ref()),
-        ) {
+        match upsert_session_log_entry_on_conn(&tx, &request_id, msg, timing, &pricing_cache) {
             // 补全已有的行也算进 imported：数据变了，界面要跟着刷新
             Ok(SessionRowOutcome::Inserted | SessionRowOutcome::Updated) => imported += 1,
             Ok(SessionRowOutcome::Skipped) => skipped += 1,
@@ -1096,11 +1088,48 @@ fn find_stored_session_row(
     .map_err(|e| AppError::Database(format!("查询已入库的会话日志失败: {e}")))
 }
 
+/// 单个文件导入事务的定价缓存；连接锁释放时一起丢弃，不跨事务缓存旧价或未命中。
+///
+/// 定价表住在配置库里，日志库没有副本——所以这份快照必须在拿日志锁之前取好：
+/// 导入事务期间只读快照，一个请求就不会同时持有配置库和日志库两把锁。
+#[derive(Default)]
+struct SessionPricingCache {
+    entries: HashMap<String, Option<ModelPricing>>,
+    #[cfg(test)]
+    lookup_count: usize,
+}
+
+impl SessionPricingCache {
+    /// 从配置库取好本次导入要用到的定价（拿日志锁之前调用）。
+    ///
+    /// 每个模型只查一次价，命中和未命中都记进快照：下一轮导入重新取快照，
+    /// 所以刚改的价、刚补的价下一轮就看得见。
+    fn snapshot<'a>(
+        conn: &rusqlite::Connection,
+        models: impl Iterator<Item = &'a str>,
+    ) -> Self {
+        let mut cache = Self::default();
+        for model in models {
+            cache
+                .entries
+                .entry(model.to_string())
+                .or_insert_with(|| find_model_pricing(conn, model));
+        }
+        #[cfg(test)]
+        {
+            cache.lookup_count = cache.entries.len();
+        }
+        cache
+    }
+
+    /// 取快照里的定价；快照外的模型按缺价处理。
+    fn get(&self, model: &str) -> Option<&ModelPricing> {
+        self.entries.get(model).and_then(|pricing| pricing.as_ref())
+    }
+}
+
 /// 一条回复按定价算出来的五项成本：输入、输出、缓存读、缓存写、合计。
-fn session_costs(
-    msg: &ParsedAssistantUsage,
-    pricing: Option<&ModelPricing>,
-) -> [String; 5] {
+fn session_costs(msg: &ParsedAssistantUsage, pricing_cache: &SessionPricingCache) -> [String; 5] {
     let usage = TokenUsage {
         input_tokens: msg.input_tokens,
         output_tokens: msg.output_tokens,
@@ -1110,7 +1139,7 @@ fn session_costs(
         model: Some(msg.model.clone()),
         message_id: None,
     };
-    match pricing {
+    match pricing_cache.get(&msg.model) {
         Some(pricing) => {
             let cost = CostCalculator::calculate(&usage, pricing, Decimal::from(1));
             [
@@ -1141,7 +1170,7 @@ fn refresh_session_log_entry_on_conn(
     timing: Option<EstimatedTiming>,
     stored: &StoredSessionRow,
     dedup_key: &DedupKey,
-    pricing: Option<&ModelPricing>,
+    pricing_cache: &SessionPricingCache,
 ) -> Result<SessionRowOutcome, AppError> {
     if stored.data_source != "session_log" {
         return Ok(SessionRowOutcome::Skipped);
@@ -1180,7 +1209,7 @@ fn refresh_session_log_entry_on_conn(
     }
 
     let [input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost] =
-        session_costs(msg, pricing);
+        session_costs(msg, pricing_cache);
     conn.execute(
         "UPDATE proxy_request_logs SET
             input_tokens = ?1, output_tokens = ?2, cache_read_tokens = ?3,
@@ -1217,7 +1246,7 @@ fn upsert_session_log_entry_on_conn(
     request_id: &str,
     msg: &ParsedAssistantUsage,
     timing: Option<EstimatedTiming>,
-    pricing: Option<&ModelPricing>,
+    pricing_cache: &SessionPricingCache,
 ) -> Result<SessionRowOutcome, AppError> {
     let created_at = msg
         .timestamp
@@ -1245,7 +1274,13 @@ fn upsert_session_log_entry_on_conn(
     };
     if let Some(stored) = find_stored_session_row(conn, request_id)? {
         return refresh_session_log_entry_on_conn(
-            conn, request_id, msg, timing, &stored, &dedup_key, pricing,
+            conn,
+            request_id,
+            msg,
+            timing,
+            &stored,
+            &dedup_key,
+            pricing_cache,
         );
     }
     if has_matching_proxy_usage_log(conn, &dedup_key)? {
@@ -1253,7 +1288,7 @@ fn upsert_session_log_entry_on_conn(
     }
 
     let [input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost] =
-        session_costs(msg, pricing);
+        session_costs(msg, pricing_cache);
 
     let inserted_rows = conn
         .execute(
@@ -1335,6 +1370,192 @@ pub fn get_data_source_breakdown(db: &Database) -> Result<Vec<DataSourceSummary>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pricing_test_message(model: &str) -> ParsedAssistantUsage {
+        ParsedAssistantUsage {
+            message_id: "pricing-test".to_string(),
+            model: model.to_string(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 10,
+            cache_creation_tokens: 5,
+            cache_creation_1h_tokens: 2,
+            stop_reason: Some("end_turn".to_string()),
+            timestamp: Some("2026-06-07T13:01:23Z".to_string()),
+            session_id: Some("pricing-session".to_string()),
+        }
+    }
+
+    fn seed_test_pricing(conn: &rusqlite::Connection, model: &str, factor: u32) {
+        conn.execute(
+            "INSERT OR REPLACE INTO model_pricing (
+                model_id, display_name, input_cost_per_million, output_cost_per_million,
+                cache_read_cost_per_million, cache_creation_cost_per_million
+             ) VALUES (?1, ?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                model,
+                factor.to_string(),
+                (2 * factor).to_string(),
+                (3 * factor).to_string(),
+                (4 * factor).to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn assert_test_costs(costs: &[String; 5], factor: u32, output_tokens: u32) {
+        let output = Decimal::from(output_tokens * 2 * factor) / Decimal::from(1_000_000);
+        let expected = [
+            Decimal::new(100 * i64::from(factor), 6),
+            output,
+            Decimal::new(30 * i64::from(factor), 6),
+            // 3 five-minute tokens + 2 one-hour tokens at 1.6x the write rate.
+            Decimal::new(248 * i64::from(factor), 7),
+            Decimal::new(1548 * i64::from(factor), 7) + output,
+        ];
+        let actual: [Decimal; 5] = std::array::from_fn(|index| costs[index].parse().unwrap());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_transaction_pricing_cache_reuses_hits_misses_and_streamed_updates(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let models = [
+            "pricing-model-a",
+            "pricing-model-b",
+            "pricing-model-missing",
+        ];
+        {
+            // 定价住在配置库里：先入库，快照再从配置库取。
+            let config_conn = lock_conn!(db.conn);
+            seed_test_pricing(&config_conn, models[0], 1);
+            seed_test_pricing(&config_conn, models[1], 2);
+        }
+        // 每次都新建快照 = 旧实现每条回复都查一次价：300 条回复就是 300 次查价。
+        let mut uncached_lookups = 0;
+        let mut expected_costs: Vec<[String; 5]> = Vec::new();
+        {
+            let config_conn = lock_conn!(db.conn);
+            for _ in 0..100 {
+                for (model_index, model) in models.iter().enumerate() {
+                    let fresh =
+                        SessionPricingCache::snapshot(&config_conn, std::iter::once(*model));
+                    uncached_lookups += fresh.lookup_count;
+                    if expected_costs.len() <= model_index {
+                        expected_costs.push(session_costs(&pricing_test_message(model), &fresh));
+                    }
+                }
+            }
+        }
+        assert_eq!(uncached_lookups, 300);
+
+        // 一次导入共用一份快照：每个模型只查一次价。
+        let cache = {
+            let config_conn = lock_conn!(db.conn);
+            SessionPricingCache::snapshot(&config_conn, models.iter().copied())
+        };
+        assert_eq!(cache.lookup_count, 3);
+
+        let conn = lock_logs_conn!(db.logs_conn);
+        let tx = conn.unchecked_transaction()?;
+
+        for index in 0..100 {
+            for (model_index, model) in models.iter().enumerate() {
+                let msg = pricing_test_message(model);
+                let expected = &expected_costs[model_index];
+                if model_index < 2 {
+                    assert_test_costs(expected, model_index as u32 + 1, msg.output_tokens);
+                } else {
+                    assert_eq!(expected, &std::array::from_fn(|_| "0".to_string()));
+                }
+                let id = format!("session:pricing-{model_index}-{index}");
+                assert_eq!(
+                    upsert_session_log_entry_on_conn(&tx, &id, &msg, None, &cache)?,
+                    SessionRowOutcome::Inserted
+                );
+                let stored: [String; 5] = tx.query_row(
+                    "SELECT input_cost_usd, output_cost_usd, cache_read_cost_usd,
+                            cache_creation_cost_usd, total_cost_usd
+                     FROM proxy_request_logs WHERE request_id = ?1",
+                    [&id],
+                    |row| {
+                        Ok([
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ])
+                    },
+                )?;
+                assert_eq!(&stored, expected);
+            }
+        }
+        assert_eq!(cache.lookup_count, 3);
+
+        // Completing a partial reply shares the same model lookup with inserts.
+        let mut completed = pricing_test_message(models[0]);
+        completed.output_tokens = 40;
+        assert_eq!(
+            upsert_session_log_entry_on_conn(
+                &tx,
+                "session:pricing-0-0",
+                &completed,
+                None,
+                &cache,
+            )?,
+            SessionRowOutcome::Updated
+        );
+        let total: String = tx.query_row(
+            "SELECT total_cost_usd FROM proxy_request_logs WHERE request_id = ?1",
+            ["session:pricing-0-0"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(total.parse::<Decimal>().unwrap(), Decimal::new(2348, 7));
+        assert_eq!(cache.lookup_count, 3);
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_transaction_observes_updated_and_previously_missing_pricing() -> Result<(), AppError>
+    {
+        let db = Database::memory()?;
+        let priced = pricing_test_message("pricing-model-existing");
+        let missing = pricing_test_message("pricing-model-new");
+        {
+            let config_conn = lock_conn!(db.conn);
+            seed_test_pricing(&config_conn, &priced.model, 1);
+        }
+        {
+            // 这一轮的快照：已有价按旧价算，缺价的模型算 0。
+            let config_conn = lock_conn!(db.conn);
+            let models = [priced.model.as_str(), missing.model.as_str()];
+            let cache = SessionPricingCache::snapshot(&config_conn, models.iter().copied());
+            assert_test_costs(&session_costs(&priced, &cache), 1, 20);
+            assert_eq!(
+                session_costs(&missing, &cache),
+                std::array::from_fn(|_| "0".to_string())
+            );
+            assert_eq!(cache.lookup_count, 2);
+        }
+        // 改价、补价都落在配置库里：下一轮的快照要看得见。
+        {
+            let config_conn = lock_conn!(db.conn);
+            seed_test_pricing(&config_conn, &priced.model, 2);
+            seed_test_pricing(&config_conn, &missing.model, 3);
+        }
+        {
+            let config_conn = lock_conn!(db.conn);
+            let models = [priced.model.as_str(), missing.model.as_str()];
+            let cache = SessionPricingCache::snapshot(&config_conn, models.iter().copied());
+            assert_test_costs(&session_costs(&priced, &cache), 2, 20);
+            assert_test_costs(&session_costs(&missing, &cache), 3, 20);
+            assert_eq!(cache.lookup_count, 2);
+        }
+        Ok(())
+    }
 
     #[test]
     fn sync_result_notification_is_coalesced_to_one_call() {
@@ -1492,7 +1713,13 @@ mod tests {
 
         let outcome = {
             let conn = lock_logs_conn!(db.logs_conn);
-            upsert_session_log_entry_on_conn(&conn, "session:msg_1", &msg, None, None)?
+            upsert_session_log_entry_on_conn(
+                &conn,
+                "session:msg_1",
+                &msg,
+                None,
+                &SessionPricingCache::default(),
+            )?
         };
         assert_eq!(outcome, SessionRowOutcome::Skipped);
 
@@ -2043,7 +2270,7 @@ mod tests {
     }
 
     fn first_token_of(db: &Database, msg_id: &str) -> Option<i64> {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.logs_conn.lock().unwrap();
         conn.query_row(
             "SELECT first_token_ms FROM proxy_request_logs WHERE request_id = ?1",
             [format!("session:{msg_id}")],
@@ -2061,7 +2288,7 @@ mod tests {
 
     /// (输出 token, 合计成本, 耗时)
     fn stored_row(db: &Database, msg_id: &str) -> Option<(i64, String, i64)> {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.logs_conn.lock().unwrap();
         conn.query_row(
             "SELECT output_tokens, total_cost_usd, latency_ms FROM proxy_request_logs
              WHERE request_id = ?1",
@@ -2073,7 +2300,7 @@ mod tests {
     }
 
     fn latency_of(db: &Database, msg_id: &str) -> i64 {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.logs_conn.lock().unwrap();
         conn.query_row(
             "SELECT latency_ms FROM proxy_request_logs WHERE request_id = ?1",
             [format!("session:{msg_id}")],
@@ -2341,7 +2568,7 @@ mod tests {
 
         // 请求结束后路由服务记下了同一次请求
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,
@@ -2381,7 +2608,7 @@ mod tests {
         sync_with_cursor(&db, &file)?;
 
         assert_eq!(stored_row(&db, "msg_p"), None);
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
             row.get(0)
         })?;

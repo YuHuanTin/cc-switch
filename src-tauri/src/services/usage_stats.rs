@@ -1074,7 +1074,7 @@ impl Database {
         app_type: &str,
         session_id: &str,
     ) -> Result<UsageSummary, AppError> {
-        let conn = lock_conn!(self.conn);
+        let conn = lock_logs_conn!(self.logs_conn);
         let fresh_input = fresh_input_sql("l");
         let app_type_expr = folded_app_type_sql("l.app_type");
         let data_source = data_source_expr("l");
@@ -1623,7 +1623,8 @@ impl Database {
         provider_name: Option<&str>,
         model: Option<&str>,
     ) -> Result<Option<String>, AppError> {
-        let conn = lock_conn!(self.conn);
+        self.refresh_provider_catalog_cache()?;
+        let conn = lock_logs_conn!(self.logs_conn);
 
         let mut detail_conditions = Vec::new();
         let mut detail_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1843,7 +1844,7 @@ impl Database {
                     &conn,
                     "l.provider_id || char(31) || l.app_type",
                     "FROM proxy_request_logs l
-                     LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type",
+                     LEFT JOIN provider_catalog_cache p ON l.provider_id = p.provider_id AND l.app_type = p.app_type",
                     &detail_where,
                     &eligible_sql,
                     &detail_refs,
@@ -2701,7 +2702,7 @@ fn query_model_pricing_exact(
         "SELECT input_cost_per_million, output_cost_per_million,
                 cache_read_cost_per_million, cache_creation_cost_per_million
          FROM model_pricing
-         WHERE model_id = ?1",
+         WHERE model_id = ?1 COLLATE NOCASE",
         [model_id],
         |row| {
             Ok((
@@ -5855,6 +5856,31 @@ mod tests {
         let (input, output, ..) = row.unwrap();
         assert_eq!(input, "0.84");
         assert_eq!(output, "4.2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pricing_lookup_matches_custom_rows_with_uppercase_model_id() -> Result<(), AppError> {
+        // 回归 #8413：自定义定价常按界面显示名原样入库（如 GLM-5.3-Flash-EXL3），
+        // 而查价候选会被 clean_model_id_for_pricing 小写归一化；若精确匹配大小写
+        // 敏感，这类行永远命中不了，成本恒为 0。查价必须大小写不敏感。
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+
+        conn.execute(
+            "INSERT OR REPLACE INTO model_pricing (
+                model_id, display_name, input_cost_per_million, output_cost_per_million,
+                cache_read_cost_per_million, cache_creation_cost_per_million
+            ) VALUES ('GLM-5.3-Flash-EXL3', 'GLM-5.3-Flash-EXL3', '1.4', '4.4', '0.26', '0')",
+            [],
+        )?;
+
+        let row = find_model_pricing_row(&conn, "GLM-5.3-Flash-EXL3")?;
+        assert!(row.is_some(), "小写候选应能命中按大写入库的自定义定价行");
+        let (input, output, ..) = row.unwrap();
+        assert_eq!(input, "1.4");
+        assert_eq!(output, "4.4");
 
         Ok(())
     }

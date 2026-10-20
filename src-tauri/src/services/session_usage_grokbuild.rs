@@ -948,7 +948,7 @@ mod tests {
         let event_at = unix_now() - SETTLE_WINDOW_SECONDS - 5;
         {
             // 接管态：代理行比 turn_completed 晚几秒落库
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO proxy_request_logs (
                     request_id, provider_id, app_type, model, request_model,

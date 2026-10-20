@@ -254,7 +254,12 @@ impl ProxyResponse {
                                 Some((Ok(Bytes::new()), body))
                             }
                         }
-                        Some(Err(e)) => Some((Err(std::io::Error::other(e.to_string())), body)),
+                        Some(Err(e)) => Some((
+                            Err(std::io::Error::other(super::error::describe_error_chain(
+                                &e,
+                            ))),
+                            body,
+                        )),
                         None => None,
                     }
                 })
@@ -265,9 +270,9 @@ impl ProxyResponse {
                     as std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>
             }
             Self::Reqwest(r) => {
-                let stream = r
-                    .bytes_stream()
-                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+                let stream = r.bytes_stream().map(|r| {
+                    r.map_err(|e| std::io::Error::other(super::error::describe_reqwest_error(e)))
+                });
                 Box::pin(stream)
             }
             Self::Captured { response, capture } => {
@@ -359,7 +364,12 @@ pub async fn send_request(
     let resp = tokio::time::timeout(timeout, client.request(req))
         .await
         .map_err(|_| ProxyError::Timeout(format!("请求超时: {}s", timeout.as_secs())))?
-        .map_err(|e| ProxyError::ForwardFailed(format!("上游请求失败: {e}")))?;
+        .map_err(|e| {
+            ProxyError::ForwardFailed(format!(
+                "上游请求失败: {}",
+                super::error::describe_error_chain(&e)
+            ))
+        })?;
 
     Ok(ProxyResponse::Hyper(resp))
 }
