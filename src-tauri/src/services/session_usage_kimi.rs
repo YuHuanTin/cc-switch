@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(
             (
                 stats[0].speed_output_tokens,
-                stats[0].speed_generation_ms,
+                stats[0].speed_duration_ms,
                 stats[0].first_token_median_ms
             ),
             (0, 0, None)

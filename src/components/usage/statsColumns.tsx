@@ -11,17 +11,17 @@ import { usageTable } from "./usageTable";
 /** 供应商 / 模型统计行共有的速度分子分母与首字中位数（后端只统计满足条件的明细请求）。 */
 export interface SpeedTotals {
   speedOutputTokens?: number;
-  speedGenerationMs?: number;
+  speedDurationMs?: number;
   estSpeedOutputTokens?: number;
   estSpeedDurationMs?: number;
   firstTokenMedianMs?: number | null;
   estFirstTokenMedianMs?: number | null;
 }
 
-/** 一行的汇总速度：Σ输出 ÷ Σ生成时间。 */
+/** 一行的汇总速度：Σ输出 ÷ Σ总耗时。 */
 export function getStatsSpeed(stat: SpeedTotals): string | null {
   return formatTokensPerSecond(
-    getAggregateTokensPerSecond(stat.speedOutputTokens, stat.speedGenerationMs),
+    getAggregateTokensPerSecond(stat.speedOutputTokens, stat.speedDurationMs),
   );
 }
 

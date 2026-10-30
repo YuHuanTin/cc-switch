@@ -41,11 +41,11 @@ describe("ProviderStatsTable", () => {
   it("computes speed as total output over total generation time", () => {
     expect(
       getStatsSpeed(
-        stat({ speedOutputTokens: 1_200, speedGenerationMs: 10_500 }),
+        stat({ speedOutputTokens: 1_200, speedDurationMs: 10_500 }),
       ),
     ).toBe("114");
     expect(
-      getStatsSpeed(stat({ speedOutputTokens: 0, speedGenerationMs: 0 })),
+      getStatsSpeed(stat({ speedOutputTokens: 0, speedDurationMs: 0 })),
     ).toBeNull();
     // 老后端没有这两个字段
     expect(getStatsSpeed(stat({}))).toBeNull();
@@ -75,7 +75,7 @@ describe("ProviderStatsTable", () => {
           providerName: "Mixed",
           requestCount: 3,
           speedOutputTokens: 9_200,
-          speedGenerationMs: 100_000,
+          speedDurationMs: 100_000,
           estSpeedOutputTokens: 2_500,
           estSpeedDurationMs: 25_000,
         }),
@@ -106,7 +106,7 @@ describe("ProviderStatsTable", () => {
           providerName: "DeepSeek",
           requestCount: 9,
           speedOutputTokens: 9_200,
-          speedGenerationMs: 100_000,
+          speedDurationMs: 100_000,
         }),
       ],
     });

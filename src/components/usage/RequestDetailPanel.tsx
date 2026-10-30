@@ -275,26 +275,19 @@ function useDetailSections(request: RequestLog) {
             label: t("usage.speed"),
             value: t("usage.speedValue", { value: tps }),
           }
-        : firstToken == null
+        : request.outputTokens < SPEED_MIN_OUTPUT_TOKENS
           ? {
               key: "speed",
               label: t("usage.speed"),
-              value: t("usage.detail.noFirstToken"),
+              value: t("usage.detail.speedTooFew"),
               muted: true,
             }
-          : request.outputTokens < SPEED_MIN_OUTPUT_TOKENS
-            ? {
-                key: "speed",
-                label: t("usage.speed"),
-                value: t("usage.detail.speedTooFew"),
-                muted: true,
-              }
-            : {
-                key: "speed",
-                label: t("usage.speed"),
-                value: "—",
-                muted: true,
-              };
+          : {
+              key: "speed",
+              label: t("usage.speed"),
+              value: "—",
+              muted: true,
+            };
     performance = [speedRow];
     if (firstToken != null) {
       performance.push({

@@ -203,45 +203,43 @@ interface OutputTokensPerSecondInput {
 }
 
 /**
- * 一条请求的生成时间（毫秒）= 耗时 − 首字。缺耗时或首字、或差值不大于 0 时返回 null。
- * 只算路由服务记的请求：会话日志的耗时和首字都是按时间戳估的，不算精确速度
- * （会话日志另有估算，见 [getEstimatedTokensPerSecond]）；非流式请求没有首字。
+ * 一条请求的总耗时（毫秒）= latency。缺耗时或不为正时返回 null。
+ * 只算路由服务记的请求：会话日志的耗时是按时间戳估的，不算精确速度
+ * （会话日志另有估算，见 [getEstimatedTokensPerSecond]）。
  */
-export function getGenerationMs(
+export function getSpeedDurationMs(
   log: OutputTokensPerSecondInput,
 ): number | null {
   if (isSessionLogRequest(log)) return null;
   const latencyMs = parseFiniteNumber(log.latencyMs);
-  const firstTokenMs = parseFiniteNumber(log.firstTokenMs);
-  if (latencyMs == null || firstTokenMs == null) return null;
-  const generationMs = latencyMs - firstTokenMs;
-  return generationMs > 0 ? generationMs : null;
+  if (latencyMs == null) return null;
+  return latencyMs > 0 ? latencyMs : null;
 }
 
-// 生成窗口短于此值时不算速度：中转站缓冲后一次性吐出、或短回复整段落在
-// 同一个网络包里，窗口只剩几毫秒，算出来的是传输突发而不是生成速度。
-export const SPEED_MIN_GENERATION_MS = 100;
+// 总耗时短于此值时不算速度：中转站缓冲后一次性吐出、或短回复整段落在
+// 同一个网络包里，窗口只剩几毫秒，算出来的是传输突发而不是真实速度。
+export const SPEED_MIN_DURATION_MS = 100;
 
-/** 这条请求能不能算速度：输出不少于 100 token，且生成时间不短于 100 毫秒。 */
+/** 这条请求能不能算速度：输出不少于 100 token，且总耗时不短于 100 毫秒。 */
 export function isSpeedEligible(log: OutputTokensPerSecondInput): boolean {
   const outputTokens = parseFiniteNumber(log.outputTokens);
-  const generationMs = getGenerationMs(log);
+  const durationMs = getSpeedDurationMs(log);
   return (
     outputTokens != null &&
     outputTokens >= SPEED_MIN_OUTPUT_TOKENS &&
-    generationMs != null &&
-    generationMs >= SPEED_MIN_GENERATION_MS
+    durationMs != null &&
+    durationMs >= SPEED_MIN_DURATION_MS
   );
 }
 
-/** 单条速度（tok/s）= 输出 token ÷ ((耗时 − 首字) / 1000)；不满足条件返回 null。 */
+/** 单条速度（tok/s）= 输出 token ÷ (总耗时 / 1000)；不满足条件返回 null。 */
 export function getOutputTokensPerSecond(
   log: OutputTokensPerSecondInput,
 ): number | null {
   if (!isSpeedEligible(log)) return null;
   const outputTokens = parseFiniteNumber(log.outputTokens) as number;
-  const generationMs = getGenerationMs(log) as number;
-  const tps = outputTokens / (generationMs / 1000);
+  const durationMs = getSpeedDurationMs(log) as number;
+  const tps = outputTokens / (durationMs / 1000);
   return Number.isFinite(tps) && tps > 0 ? tps : null;
 }
 
@@ -293,15 +291,15 @@ export function getEstimatedTokensPerSecond(
 }
 
 /**
- * 汇总速度 = Σ输出 ÷ Σ生成时间（只算满足条件的请求），不是逐条平均——
+ * 汇总速度 = Σ输出 ÷ Σ总耗时（只算满足条件的请求），不是逐条平均——
  * 逐条平均会被短请求带歪。分子分母都来自后端汇总（或 [sumSpeedTotals]）。
  */
 export function getAggregateTokensPerSecond(
   outputTokens: unknown,
-  generationMs: unknown,
+  durationMs: unknown,
 ): number | null {
   const output = parseFiniteNumber(outputTokens);
-  const ms = parseFiniteNumber(generationMs);
+  const ms = parseFiniteNumber(durationMs);
   if (output == null || ms == null || output <= 0 || ms <= 0) return null;
   const tps = output / (ms / 1000);
   return Number.isFinite(tps) && tps > 0 ? tps : null;
@@ -310,16 +308,16 @@ export function getAggregateTokensPerSecond(
 /** 前端已有明细时的汇总：只累加满足条件的请求。 */
 export function sumSpeedTotals(logs: readonly OutputTokensPerSecondInput[]): {
   outputTokens: number;
-  generationMs: number;
+  durationMs: number;
 } {
   let outputTokens = 0;
-  let generationMs = 0;
+  let durationMs = 0;
   for (const log of logs) {
     if (!isSpeedEligible(log)) continue;
     outputTokens += parseFiniteNumber(log.outputTokens) as number;
-    generationMs += getGenerationMs(log) as number;
+    durationMs += getSpeedDurationMs(log) as number;
   }
-  return { outputTokens, generationMs };
+  return { outputTokens, durationMs };
 }
 
 /** tok/s 的显示：≥ 1 取整，否则一位小数；null 原样返回（界面显示「—」）。 */

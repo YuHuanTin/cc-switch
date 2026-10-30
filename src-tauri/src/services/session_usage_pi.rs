@@ -1606,7 +1606,7 @@ mod tests {
         assert_eq!(stats[0].est_speed_output_tokens, 1_500);
         assert_eq!(stats[0].est_speed_duration_ms, 30_000);
         assert_eq!(stats[0].speed_output_tokens, 0);
-        assert_eq!(stats[0].speed_generation_ms, 0);
+        assert_eq!(stats[0].speed_duration_ms, 0);
         Ok(())
     }
 

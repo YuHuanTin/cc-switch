@@ -93,7 +93,7 @@ describe("UsageDashboard (smoke)", () => {
         successRate: 99.4,
         avgLatencyMs: 9000,
         speedOutputTokens: 92_000,
-        speedGenerationMs: 1_000_000,
+        speedDurationMs: 1_000_000,
       },
     ]);
     usageApiMock.getModelStats.mockResolvedValue([

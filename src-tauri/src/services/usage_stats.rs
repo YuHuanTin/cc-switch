@@ -126,14 +126,14 @@ pub struct ProviderStats {
     pub total_cost: String,
     pub success_rate: f32,
     pub avg_latency_ms: u64,
-    /// 速度的分子：满足条件（有首字、输出 >= 100 token、耗时 > 首字）的明细请求的输出 token 之和。
-    /// 汇总速度 = speed_output_tokens / (speed_generation_ms / 1000)，不是逐条平均。
+    /// 速度的分子：满足条件（输出 >= 100 token、耗时 >= 100 毫秒）的明细请求的输出 token 之和。
+    /// 汇总速度 = speed_output_tokens / (speed_duration_ms / 1000)，不是逐条平均。
     /// 日汇总（rollup）没有逐条计时，不计入。
     pub speed_output_tokens: u64,
-    /// 速度的分母：同一批请求的 (latency_ms - first_token_ms) 之和，单位毫秒。
-    pub speed_generation_ms: u64,
+    /// 速度的分母：同一批请求的总耗时 latency_ms 之和，单位毫秒。
+    pub speed_duration_ms: u64,
     /// 估算速度的分子：会话日志导入的请求里，有估算耗时、输出 >= 200 token 的那些的输出之和。
-    /// 和上面那组分开累计：估算的耗时含首字等待，口径不同，不能加在一起。
+    /// 和上面那组分开累计：估算的耗时是按日志时间戳推的，口径不同，不能加在一起。
     pub est_speed_output_tokens: u64,
     /// 估算速度的分母：同一批请求的 latency_ms 之和，单位毫秒。
     pub est_speed_duration_ms: u64,
@@ -147,18 +147,18 @@ pub struct ProviderStats {
 /// 计速度的门槛：输出少于这个数的请求（工具调用这类）不算速度，避免 0.1 秒回 15 个 token 算出离谱的数。
 pub const SPEED_MIN_OUTPUT_TOKENS: i64 = 100;
 
-/// 生成窗口（耗时 − 首字）短于这个毫秒数时不算速度：中转站缓冲后一次性吐出、
-/// 或短回复整段落在同一个网络包里，算出来的是传输突发而不是生成速度。
-pub const SPEED_MIN_GENERATION_MS: i64 = 100;
+/// 总耗时短于这个毫秒数时不算速度：中转站缓冲后一次性吐出、
+/// 或短回复整段落在同一个网络包里，算出来的是传输突发而不是真实速度。
+pub const SPEED_MIN_DURATION_MS: i64 = 100;
 
-/// 明细行能不能计速度的 SQL 条件（和前端 `isSpeedEligible` 同口径）。会话日志导入的行
-/// 也可能有首字（按时间戳推出来的），所以先按来源分开，不能只看有没有首字。
+/// 明细行能不能计速度的 SQL 条件（和前端 `isSpeedEligible` 同口径）：速度按
+/// 输出 token ÷ 总耗时（latency_ms）算，会话日志导入的行走下面的估算口径。
 fn speed_eligible_sql(alias: &str) -> String {
     let data_source = data_source_expr(alias);
     format!(
-        "{data_source} = 'proxy' AND {alias}.first_token_ms IS NOT NULL \
+        "{data_source} = 'proxy' \
          AND {alias}.output_tokens >= {SPEED_MIN_OUTPUT_TOKENS} \
-         AND {alias}.latency_ms - {alias}.first_token_ms >= {SPEED_MIN_GENERATION_MS}"
+         AND {alias}.latency_ms >= {SPEED_MIN_DURATION_MS}"
     )
 }
 
@@ -261,7 +261,7 @@ pub struct ModelStats {
     pub success_rate: f32,
     /// 速度的分子分母，口径同 [`ProviderStats::speed_output_tokens`] 那四个字段。
     pub speed_output_tokens: u64,
-    pub speed_generation_ms: u64,
+    pub speed_duration_ms: u64,
     pub est_speed_output_tokens: u64,
     pub est_speed_duration_ms: u64,
     /// 首字时间中位数，口径同 [`ProviderStats`] 的那两个字段。
@@ -1800,7 +1800,7 @@ impl Database {
                     THEN SUM(latency_sum) / SUM(request_count)
                     ELSE 0 END as avg_latency,
                 SUM(speed_output) as speed_output,
-                SUM(speed_gen_ms) as speed_gen_ms,
+                SUM(speed_duration_ms) as speed_duration_ms,
                 SUM(est_output) as est_output,
                 SUM(est_ms) as est_ms
             FROM (
@@ -1812,7 +1812,7 @@ impl Database {
                     COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count,
                     COALESCE(SUM(l.latency_ms), 0) as latency_sum,
                     COALESCE(SUM(CASE WHEN {speed_ok} THEN l.output_tokens ELSE 0 END), 0) as speed_output,
-                    COALESCE(SUM(CASE WHEN {speed_ok} THEN l.latency_ms - l.first_token_ms ELSE 0 END), 0) as speed_gen_ms,
+                    COALESCE(SUM(CASE WHEN {speed_ok} THEN l.latency_ms ELSE 0 END), 0) as speed_duration_ms,
                     COALESCE(SUM(CASE WHEN {est_ok} THEN l.output_tokens ELSE 0 END), 0) as est_output,
                     COALESCE(SUM(CASE WHEN {est_ok} THEN l.latency_ms ELSE 0 END), 0) as est_ms
                 FROM proxy_request_logs l
@@ -1889,7 +1889,7 @@ impl Database {
                 success_rate,
                 avg_latency_ms: row.get::<_, f64>(7)? as u64,
                 speed_output_tokens: row.get::<_, i64>(8)?.max(0) as u64,
-                speed_generation_ms: row.get::<_, i64>(9)?.max(0) as u64,
+                speed_duration_ms: row.get::<_, i64>(9)?.max(0) as u64,
                 est_speed_output_tokens: row.get::<_, i64>(10)?.max(0) as u64,
                 est_speed_duration_ms: row.get::<_, i64>(11)?.max(0) as u64,
                 first_token_median_ms,
@@ -2006,7 +2006,7 @@ impl Database {
                 SUM(total_cost) as total_cost,
                 SUM(success_count) as success_count,
                 SUM(speed_output) as speed_output,
-                SUM(speed_gen_ms) as speed_gen_ms,
+                SUM(speed_duration_ms) as speed_duration_ms,
                 SUM(est_output) as est_output,
                 SUM(est_ms) as est_ms
             FROM (
@@ -2016,7 +2016,7 @@ impl Database {
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost,
                     COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count,
                     COALESCE(SUM(CASE WHEN {speed_ok} THEN l.output_tokens ELSE 0 END), 0) as speed_output,
-                    COALESCE(SUM(CASE WHEN {speed_ok} THEN l.latency_ms - l.first_token_ms ELSE 0 END), 0) as speed_gen_ms,
+                    COALESCE(SUM(CASE WHEN {speed_ok} THEN l.latency_ms ELSE 0 END), 0) as speed_duration_ms,
                     COALESCE(SUM(CASE WHEN {est_ok} THEN l.output_tokens ELSE 0 END), 0) as est_output,
                     COALESCE(SUM(CASE WHEN {est_ok} THEN l.latency_ms ELSE 0 END), 0) as est_ms
                 FROM proxy_request_logs l
@@ -2092,7 +2092,7 @@ impl Database {
                 avg_cost_per_request: format!("{avg_cost:.6}"),
                 success_rate,
                 speed_output_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                speed_generation_ms: row.get::<_, i64>(6)?.max(0) as u64,
+                speed_duration_ms: row.get::<_, i64>(6)?.max(0) as u64,
                 est_speed_output_tokens: row.get::<_, i64>(7)?.max(0) as u64,
                 est_speed_duration_ms: row.get::<_, i64>(8)?.max(0) as u64,
                 first_token_median_ms,
@@ -5097,7 +5097,7 @@ mod tests {
                     ],
                 )
             };
-            // fast：精确速度 1000 token / 10000 ms，另有一条失败请求
+            // fast：速度按 1000 token / 11000 ms（总耗时）算，另有一条失败请求
             insert("fast-ok", "fast", 1_000, 11_000, Some(1_000), 200, "proxy")?;
             insert("fast-err", "fast", 0, 500, None, 500, "proxy")?;
             // slow：只有会话日志，估算速度 400 token / 8000 ms
@@ -5109,7 +5109,7 @@ mod tests {
         assert_eq!(fast.request_count, 2);
         assert!((fast.success_rate - 50.0).abs() < f32::EPSILON);
         assert_eq!(fast.speed_output_tokens, 1_000);
-        assert_eq!(fast.speed_generation_ms, 10_000);
+        assert_eq!(fast.speed_duration_ms, 11_000);
         assert_eq!(fast.est_speed_output_tokens, 0);
 
         let slow = stats.iter().find(|s| s.model == "slow").expect("slow");
@@ -5351,25 +5351,25 @@ mod tests {
                     params![id, "p1", "claude", "m", 10, output, "0", latency, first, 200, 1000],
                 )
             };
-            // 计入：1000 token / (11000 - 1000) ms
+            // 计入：1000 token / 11000 ms（总耗时，不减首字）
             insert("ok-a", 1000, 11_000, Some(1_000))?;
-            // 计入：300 token / (4000 - 1000) ms
+            // 计入：300 token / 4000 ms
             insert("ok-b", 300, 4_000, Some(1_000))?;
             // 不计：输出不到 100
             insert("short", 50, 2_000, Some(100))?;
-            // 不计：没有首字（会话日志 / 非流式）
+            // 计入：没有首字（非流式）也按总耗时算
             insert("no-ttft", 5_000, 9_000, None)?;
-            // 不计：耗时不大于首字
+            // 计入：首字等于总耗时也按总耗时算
             insert("zero-gen", 500, 1_000, Some(1_000))?;
-            // 不计：生成窗口不到 100ms，是传输突发
+            // 计入：总耗时 1050ms
             insert("burst", 500, 1_050, Some(1_000))?;
         }
 
         let stats = db.get_provider_stats(None, None, None, None, None)?;
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].request_count, 6);
-        assert_eq!(stats[0].speed_output_tokens, 1_300);
-        assert_eq!(stats[0].speed_generation_ms, 13_000);
+        assert_eq!(stats[0].speed_output_tokens, 7_300);
+        assert_eq!(stats[0].speed_duration_ms, 26_050);
         // 路由服务的行没有首字（非流式）也不算估算速度
         assert_eq!(stats[0].est_speed_output_tokens, 0);
         assert_eq!(stats[0].est_speed_duration_ms, 0);
@@ -5413,7 +5413,7 @@ mod tests {
         assert_eq!(stats[0].est_speed_duration_ms, 25_000);
         // 估算的不混进精确口径
         assert_eq!(stats[0].speed_output_tokens, 0);
-        assert_eq!(stats[0].speed_generation_ms, 0);
+        assert_eq!(stats[0].speed_duration_ms, 0);
 
         Ok(())
     }
