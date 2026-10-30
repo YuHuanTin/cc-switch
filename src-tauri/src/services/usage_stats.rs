@@ -386,8 +386,13 @@ fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
          WHEN '_gemini_session' THEN 'Gemini (Session)' \
          WHEN '_opencode_session' THEN 'OpenCode (Session)' \
          WHEN '_grok_session' THEN 'Grok Build (Session)' \
+         WHEN '_agy_session' THEN 'Antigravity (Session)' \
+         WHEN '_kimi_session' THEN 'Kimi Code (Session)' \
+         WHEN '_dsh_session' THEN 'DeepSeek Harness (Session)' \
+         WHEN '_dsh_account_session' THEN 'DeepSeek Harness (OAuth)' \
          WHEN '_mcode_session' THEN 'MiniMax Code (Session)' \
          WHEN '_pi_session' THEN 'Pi (Session)' \
+         WHEN '_omp_session' THEN 'Oh My Pi (Session)' \
          ELSE {log_alias}.provider_id END)"
     )
 }
@@ -3059,7 +3064,7 @@ mod tests {
     fn test_request_log_total_cache_invalidates_on_writes() -> Result<(), AppError> {
         let db = Database::memory()?;
         let insert = |id: &str, created_at: i64| -> Result<(), AppError> {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 id,
@@ -3094,7 +3099,7 @@ mod tests {
 
         // 删除后也要重数
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute("DELETE FROM proxy_request_logs WHERE request_id = 'a'", [])?;
         }
         assert_eq!(db.get_request_logs(&filters, 0, 10)?.total, 2);
@@ -3601,14 +3606,17 @@ mod tests {
             ),
         ];
         {
-            let conn = lock_conn!(db.conn);
-            // Simulate an existing database with unpriced usage before the update.
-            conn.execute(
-                "DELETE FROM model_pricing WHERE model_id IN
-                 ('claude-opus-5-5', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-5.6-cyber',
-                  'gpt-5.5-pro', 'gpt-4o-mini')",
-                [],
-            )?;
+            {
+                let conn = lock_conn!(db.conn);
+                // Simulate an existing database with unpriced usage before the update.
+                conn.execute(
+                    "DELETE FROM model_pricing WHERE model_id IN
+                     ('claude-opus-5-5', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-5.6-cyber',
+                      'gpt-5.5-pro', 'gpt-4o-mini')",
+                    [],
+                )?;
+            }
+            let conn = lock_logs_conn!(db.logs_conn);
             for (model, app, input, _) in &cases {
                 insert_usage_log(
                     &conn, model, app, "p1", model, "proxy", 1000, *input, 1_000_000, 1_000_000,
@@ -3624,7 +3632,7 @@ mod tests {
         db.ensure_model_pricing_seeded()?;
         assert_eq!(db.backfill_missing_usage_costs()?, cases.len() as u64);
 
-        let conn = lock_conn!(db.conn);
+        let conn = lock_logs_conn!(db.logs_conn);
         for (model, _, _, expected) in cases {
             let costs: [String; 5] = conn.query_row(
                 "SELECT input_cost_usd, output_cost_usd, cache_read_cost_usd,
@@ -4095,7 +4103,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             // (request_id, app_type, session_id, data_source, input, output, cache_read, cost)
             let rows = [
                 (
@@ -4153,7 +4161,7 @@ mod tests {
         assert_eq!(db.get_first_usage_date(None, None, None)?, None);
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             conn.execute(
                 "INSERT INTO usage_daily_rollups (
                     date, app_type, provider_id, model,
@@ -4305,14 +4313,17 @@ mod tests {
         let ts = local_ts(2026, 6, 10, 12, 0, 0);
 
         {
-            let conn = lock_conn!(db.conn);
-            // providers 也有 created_at / cost_multiplier 列：详情查询的列必须带表别名，
-            // 否则 SQLite 报 ambiguous column name，整个命令失败。
-            conn.execute(
+            let config_conn = lock_conn!(db.conn);
+            config_conn.execute(
                 "INSERT INTO providers (id, app_type, name, settings_config, created_at) VALUES
                  ('prov-a', 'claude', 'Packy', '{}', 1)",
                 [],
             )?;
+        }
+        // providers 也有 created_at / cost_multiplier 列：详情查询的列必须带表别名，
+        // 否则 SQLite 报 ambiguous column name，整个命令失败。
+        {
+            let conn = lock_logs_conn!(db.logs_conn);
             insert_usage_log(
                 &conn,
                 "a-1",
@@ -5066,7 +5077,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             let insert = |id: &str,
                           model: &str,
                           output: i64,
@@ -5329,7 +5340,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             let insert = |id: &str, output: i64, latency: i64, first: Option<i64>| {
                 conn.execute(
                     "INSERT INTO proxy_request_logs (
@@ -5371,7 +5382,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             let insert = |id: &str, output: i64, latency: i64, source: &str| {
                 conn.execute(
                     "INSERT INTO proxy_request_logs (
@@ -5641,7 +5652,7 @@ mod tests {
         let db = Database::memory()?;
 
         {
-            let conn = lock_conn!(db.conn);
+            let conn = lock_logs_conn!(db.logs_conn);
             // Claude：input 不含缓存。真实消耗 = 100 + 200 + 1000 + 5000
             insert_usage_log(
                 &conn,

@@ -52,13 +52,13 @@ use std::sync::Mutex;
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 20;
+pub(crate) const SCHEMA_VERSION: i32 = 24;
 
 /// 独立日志数据库的版本号。
 ///
 /// 日志库从当前完整结构开始创建，不复用配置库的历史迁移版本，避免
 /// 配置库的 user_version 因日志结构变化再次增长。
-pub(crate) const LOG_SCHEMA_VERSION: i32 = 1;
+pub(crate) const LOG_SCHEMA_VERSION: i32 = 2;
 
 /// 安全地序列化 JSON，避免 unwrap panic
 pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {

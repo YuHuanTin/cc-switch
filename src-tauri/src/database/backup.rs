@@ -3277,15 +3277,20 @@ mod tests {
             stream_rows: usize,
             rollup_rows: usize,
         ) -> Result<(), AppError> {
-            let mut conn = crate::database::lock_conn!(db.conn);
-            let tx = conn.transaction()?;
-            for i in 0..50 {
-                tx.execute(
-                    "INSERT INTO providers (id, app_type, name, settings_config, meta)
-                     VALUES (?1, 'claude', ?2, '{}', '{}')",
-                    rusqlite::params![format!("p{i}"), format!("Provider {i}")],
-                )?;
+            {
+                let mut conn = crate::database::lock_conn!(db.conn);
+                let tx = conn.transaction()?;
+                for i in 0..50 {
+                    tx.execute(
+                        "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                         VALUES (?1, 'claude', ?2, '{}', '{}')",
+                        rusqlite::params![format!("p{i}"), format!("Provider {i}")],
+                    )?;
+                }
+                tx.commit()?;
             }
+            let mut conn = crate::database::lock_logs_conn!(db.logs_conn);
+            let tx = conn.transaction()?;
             for i in 0..log_rows {
                 tx.execute(
                     "INSERT INTO proxy_request_logs (
