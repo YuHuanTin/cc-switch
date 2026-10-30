@@ -143,7 +143,7 @@ fn click(app: &AppHandle, hwnd: isize, button: MouseButton, x: i32, y: i32) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
-    // 拿不到图标矩形：把光标处当成图标，面板弹在光标旁边。
+    // 拿不到图标矩形：把光标处当成图标位置。
     let rect = Rect {
         position: PhysicalPosition::new(x, y).into(),
         size: PhysicalSize::new(1u32, 1u32).into(),
@@ -158,7 +158,7 @@ fn click(app: &AppHandle, hwnd: isize, button: MouseButton, x: i32, y: i32) {
             button_state: MouseButtonState::Up,
         },
     );
-    if button == MouseButton::Right && crate::tray_panel::uses_native_menu() {
+    if button == MouseButton::Right {
         show_native_menu(hwnd, x, y);
     }
 }

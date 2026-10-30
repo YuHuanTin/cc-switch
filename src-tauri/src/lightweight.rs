@@ -26,8 +26,6 @@ pub fn enter_lightweight_mode(app: &tauri::AppHandle) -> Result<(), String> {
 
     LIGHTWEIGHT_MODE.store(true, Ordering::Release);
     persist_lightweight_mode(true);
-    // 托盘面板也是一个 WebView：收着的当场释放，开着的（在面板里点的轻量模式）收起时释放。
-    crate::tray_panel::release_if_lightweight(app);
     crate::tray::refresh_tray_menu(app);
     log::info!("进入轻量模式");
     Ok(())
