@@ -32,4 +32,4 @@
 
 ## 什么时候写
 
-和三语发布说明一起，放进打 tag 之前的 `docs(release)` 提交。`release.yml` 会先检查 `src/whats-new/<版本>.json` 是否存在，缺了直接失败，不会白跑构建。
+和三语发布说明一起，放进打 tag 之前的 `docs(release)` 提交。`release.yml` 会检查 `src/whats-new/<版本>.json` 是否存在，缺失只告警，不阻塞构建；补丁 tag（如 `v4.0.27-p1`）沿用基础版本（`4.0.27`）的摘要

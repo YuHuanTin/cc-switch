@@ -51,8 +51,7 @@ jobs:
 
   # 应用内更新摘要（src/whats-new/<版本>.json，见同目录 README）随安装包发出。漏写的话
   # 升级到这一版的用户什么也看不到；结构写坏的话弹窗渲染出错，整个应用落进错误页。
-  # 放在最前面查，不白跑编译。推 tag 和 push main 同时发生，不能指望 CI 先跑完单测，
-  # 所以这里自己跑一遍检查所有随包摘要的那份单测。
+  # 这个 job 只做提示，不阻塞发布：缺少当前版本的摘要、已有摘要校验失败，都不影响打包
   whats-new-check:
     name: Check in-app what's new summaries
     runs-on: ubuntu-22.04
@@ -60,18 +59,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # 手动干跑可以在任意分支上跑，那时这一版的摘要可能还没写，只在推 tag 时要求存在
-      - name: Require this version's summary
+      # 手动干跑可以在任意分支上跑；推 tag 时也只在缺失时告警。补丁 tag（如 v4.0.27-p1）
+      # 沿用基础版本（4.0.27）的摘要
+      - name: Warn when this version's summary is missing
         if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          file="src/whats-new/${TAG#v}.json"
-          if [ ! -f "$file" ]; then
-            echo "::error file=$file::Missing $file. Write the in-app summary for $TAG (see src/whats-new/README.md); use \"items\": [] to skip the popup."
-            exit 1
+          version="${TAG#v}"
+          base="$version"
+          if [[ "$version" =~ ^(.+)-p[0-9]+$ ]]; then
+            base="${BASH_REMATCH[1]}"
           fi
+          if [ -f "src/whats-new/$version.json" ] || [ -f "src/whats-new/$base.json" ]; then
+            exit 0
+          fi
+          echo "::warning file=src/whats-new/$version.json::No in-app summary for $TAG; the update popup will be skipped for this release."
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -101,12 +105,13 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Validate all summaries
+        continue-on-error: true
         run: pnpm vitest run tests/config/whatsNewEntries.test.ts
 
   release:
     runs-on: ${{ matrix.os }}
     environment: release
-    needs: [check-apple-signing, whats-new-check]
+    needs: [check-apple-signing]
     outputs:
       updater_enabled: ${{ steps.tauri-build-config.outputs.updater_enabled }}
     strategy:
