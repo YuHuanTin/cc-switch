@@ -237,7 +237,120 @@ pub fn normalize_anthropic_messages_for_provider(
     let mut changed =
         normalize_anthropic_tool_thinking_history_for_provider(body, provider, api_format);
     changed |= normalize_deepseek_thinking_disabled_strip_effort(body, provider);
+    changed |= normalize_commandcode_anthropic_payload(body, provider);
     changed
+}
+
+/// Command Code 的 Anthropic 兼容 `/messages` 端点把 `messages[].role` 校验为
+/// 仅 `user | assistant`，而 Claude Code 会插入会话中的 `role: "system"` 消息
+/// （环境 / 工具上下文），Anthropic 官方接口接受这种写法，Command Code 则返回
+/// `400 ... at messages.N.role` 拒绝整个请求。这里只对 Command Code 生效：
+/// 其他 Anthropic 兼容上游（如 DeepSeek）原生接受内联 system 消息，
+/// 改写它们的请求体会破坏 prompt 前缀
+fn is_commandcode_provider(provider: &Provider) -> bool {
+    let settings = &provider.settings_config;
+    [
+        settings
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(|v| v.as_str()),
+        settings.get("base_url").and_then(|v| v.as_str()),
+        settings.get("baseURL").and_then(|v| v.as_str()),
+        settings.get("apiEndpoint").and_then(|v| v.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|url| url.to_ascii_lowercase().contains("api.commandcode.ai"))
+}
+
+fn normalize_commandcode_anthropic_payload(body: &mut Value, provider: &Provider) -> bool {
+    if !is_commandcode_provider(provider) {
+        return false;
+    }
+
+    let mut changed = hoist_anthropic_system_role_messages(body);
+    changed |= strip_anthropic_thinking_display(body);
+    changed
+}
+
+/// 把 `messages[].role == "system"` 的消息上提到顶层 `system` 字段，
+/// 保持 block 顺序和 `cache_control`。Command Code 接受顶层形式
+/// （字符串或 block 数组），不接受内联形式
+fn hoist_anthropic_system_role_messages(body: &mut Value) -> bool {
+    let mut hoisted = Vec::new();
+    let removed = {
+        let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+            return false;
+        };
+
+        let original_len = messages.len();
+        let mut kept = Vec::with_capacity(original_len);
+        for message in std::mem::take(messages) {
+            if message.get("role").and_then(Value::as_str) == Some("system") {
+                if let Some(content) = message.get("content") {
+                    collect_anthropic_system_text_blocks(content, &mut hoisted);
+                }
+                continue;
+            }
+            kept.push(message);
+        }
+        *messages = kept;
+
+        original_len - messages.len()
+    };
+
+    if removed == 0 {
+        return false;
+    }
+
+    if !hoisted.is_empty() {
+        let mut merged = match body.get("system") {
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                vec![json!({"type": "text", "text": text})]
+            }
+            Some(Value::Array(blocks)) => blocks.clone(),
+            _ => Vec::new(),
+        };
+        merged.extend(hoisted);
+        body["system"] = Value::Array(merged);
+    }
+
+    true
+}
+
+fn collect_anthropic_system_text_blocks(content: &Value, out: &mut Vec<Value>) {
+    match content {
+        Value::String(text) => {
+            if !text.trim().is_empty() {
+                out.push(json!({"type": "text", "text": text}));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_anthropic_system_text_blocks(item, out);
+            }
+        }
+        Value::Object(obj) => {
+            let has_text = obj
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty());
+            if has_text {
+                out.push(Value::Object(obj.clone()));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Command Code 的 schema 早于 `thinking.display`，遇到该字段会返回
+/// `400 Invalid input at thinking`；单独 `{"type": "adaptive"}` 可以正常使用，
+/// 因此只丢弃 display 偏好
+fn strip_anthropic_thinking_display(body: &mut Value) -> bool {
+    body.get_mut("thinking")
+        .and_then(Value::as_object_mut)
+        .and_then(|thinking| thinking.remove("display"))
+        .is_some()
 }
 
 fn normalize_anthropic_tool_thinking_history(body: &mut Value) -> bool {
@@ -2663,6 +2776,94 @@ mod tests {
         assert!(!changed);
         assert!(body.get("system").is_none());
         assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn test_commandcode_hoists_system_role_messages_and_strips_thinking_display() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.commandcode.ai/provider"
+            }
+        }));
+        let mut body = json!({
+            "model": "claude-haiku-5-5",
+            "system": [
+                { "type": "text", "text": "Base.", "cache_control": { "type": "ephemeral" } }
+            ],
+            "thinking": { "type": "adaptive", "display": "updates" },
+            "messages": [
+                { "role": "user", "content": "hello" },
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "# Environment",
+                            "cache_control": { "type": "ephemeral" }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(changed);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let system = body["system"].as_array().unwrap();
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[1]["text"], "# Environment");
+        assert_eq!(system[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body["thinking"].get("display").is_none());
+    }
+
+    #[test]
+    fn test_commandcode_hoists_string_system_role_messages() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.commandcode.ai/provider"
+            }
+        }));
+        let mut body = json!({
+            "model": "claude-haiku-5-5",
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "system", "content": "Reply briefly." }
+            ]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(changed);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["system"][0]["text"], "Reply briefly.");
+    }
+
+    #[test]
+    fn test_non_commandcode_providers_keep_system_role_messages_and_thinking_display() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"
+            }
+        }));
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "thinking": { "type": "adaptive", "display": "updates" },
+            "messages": [
+                { "role": "user", "content": "hello" },
+                { "role": "system", "content": "Keep in messages." }
+            ]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(!changed);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][1]["role"], "system");
+        assert_eq!(body["thinking"]["display"], "updates");
     }
 
     #[test]
