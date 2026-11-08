@@ -42,7 +42,7 @@ jobs:
              [ -n "$APPLE_ID" ] && \
              [ -n "$APPLE_PASSWORD" ] && \
              [ -n "$APPLE_TEAM_ID" ]; then
-            echo 'matrix={"include":[{"os":"windows-2022"},{"os":"windows-11-arm","arch":"arm64"},{"os":"ubuntu-22.04"},{"os":"ubuntu-22.04-arm","arch":"arm64"},{"os":"macos-14"}]}' >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[{"os":"windows-2022"},{"os":"windows-11-arm","arch":"arm64"},{"os":"ubuntu-22.04"},{"os":"ubuntu-22.04-arm","arch":"arm64"},{"os":"macos-15"}]}' >> "$GITHUB_OUTPUT"
             echo "Apple signing credentials are configured"
           else
             echo 'matrix={"include":[{"os":"windows-2022"},{"os":"windows-11-arm","arch":"arm64"},{"os":"ubuntu-22.04"},{"os":"ubuntu-22.04-arm","arch":"arm64"}]}' >> "$GITHUB_OUTPUT"
@@ -375,6 +375,8 @@ jobs:
 
       - name: Build Tauri App (Linux)
         if: runner.os == 'Linux'
+        env:
+          LINUXDEPLOY_EXCLUDED_LIBRARIES: "libwayland-client.so*"
         run: pnpm tauri build --bundles appimage,deb,rpm --config "$TAURI_BUILD_CONFIG"
 
       - name: Prepare macOS Assets
@@ -407,8 +409,22 @@ jobs:
             exit 1
           fi
 
+          # stapler fetches the ticket from Apple's CloudKit, which sometimes drops
+          # the connection (NSURLError -1005, "Error 68"); retry instead of failing.
+          stapler_retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if xcrun stapler "$@"; then
+                return 0
+              fi
+              echo "⚠️ xcrun stapler $1 failed (attempt ${attempt}/5)" >&2
+              [ "$attempt" -lt 5 ] && sleep $((attempt * 20))
+            done
+            return 1
+          }
+
           # Staple notarization ticket to .app (Tauri already notarized it)
-          xcrun stapler staple "$APP_PATH"
+          stapler_retry staple "$APP_PATH"
           echo "✅ .app stapled"
 
           # 1) Collect .tar.gz when updater signing is enabled
@@ -477,6 +493,20 @@ jobs:
             exit 1
           fi
 
+          # stapler fetches the ticket from Apple's CloudKit, which sometimes drops
+          # the connection (NSURLError -1005, "Error 68"); retry instead of failing.
+          stapler_retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if xcrun stapler "$@"; then
+                return 0
+              fi
+              echo "⚠️ xcrun stapler $1 failed (attempt ${attempt}/5)" >&2
+              [ "$attempt" -lt 5 ] && sleep $((attempt * 20))
+            done
+            return 1
+          }
+
           echo "=== Notarizing DMG: $DMG_PATH ==="
           max_attempts=3
           for attempt in $(seq 1 "$max_attempts"); do
@@ -487,7 +517,7 @@ jobs:
               --team-id "$APPLE_TEAM_ID" \
               --wait; then
               echo "✅ DMG notarization succeeded"
-              xcrun stapler staple "$DMG_PATH"
+              stapler_retry staple "$DMG_PATH"
               echo "✅ DMG stapled"
               break
             fi
@@ -507,6 +537,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # stapler fetches the ticket from Apple's CloudKit, which sometimes drops
+          # the connection (NSURLError -1005, "Error 68"); retry instead of failing.
+          stapler_retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if xcrun stapler "$@"; then
+                return 0
+              fi
+              echo "⚠️ xcrun stapler $1 failed (attempt ${attempt}/5)" >&2
+              [ "$attempt" -lt 5 ] && sleep $((attempt * 20))
+            done
+            return 1
+          }
 
           # Verify .app (from Tauri bundle)
           APP_PATH=""
@@ -529,7 +573,7 @@ jobs:
           echo "✅ codesign verification passed"
           spctl -a -t exec -vv "$APP_PATH"
           echo "✅ spctl assessment passed"
-          xcrun stapler validate "$APP_PATH"
+          stapler_retry validate "$APP_PATH"
           echo "✅ .app stapler validation passed"
 
           # Verify .dmg (from release-assets/, created by create-dmg + notarized)
@@ -540,7 +584,7 @@ jobs:
             echo "✅ .dmg codesign verification passed"
             spctl -a -t open --context context:primary-signature -vv "$DMG_PATH"
             echo "✅ .dmg spctl assessment passed"
-            xcrun stapler validate "$DMG_PATH"
+            stapler_retry validate "$DMG_PATH"
             echo "✅ .dmg stapler validation passed"
           else
             echo "❌ No .dmg found for verification — release would ship without verified DMG" >&2
@@ -866,7 +910,7 @@ jobs:
           done
           # 缺任一平台都不能发：缺的那批用户会静默收不到更新
           missing=""
-          if [[ '${{ needs.check-apple-signing.outputs.matrix }}' == *macos-14* ]]; then
+          if [[ '${{ needs.check-apple-signing.outputs.matrix }}' == *macos-15* ]]; then
             [ -n "$mac_sig" ] || missing="$missing macOS"
           fi
           [ -n "$win_x64_sig" ] || missing="$missing windows-x86_64"

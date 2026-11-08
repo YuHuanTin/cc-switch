@@ -228,26 +228,10 @@ impl Database {
             log::warn!("Failed to sync local model pricing file: {e}");
         }
 
-        // Startup cleanup: prune old logs and reclaim space in the independent log database.
-        if let Err(e) = db.cleanup_old_stream_check_logs(7) {
-            log::warn!("Startup stream_check_logs cleanup failed: {e}");
-        }
-        if let Err(e) = db.rollup_and_prune(30) {
-            log::warn!("Startup rollup_and_prune failed: {e}");
-        }
-        // Reclaim disk space after cleanup
-        {
-            let conn = lock_conn!(db.conn);
-            if let Err(e) = Self::incremental_vacuum_on_conn(&conn) {
-                log::warn!("Startup config database incremental vacuum failed: {e}");
-            }
-        }
-        {
-            let logs_conn = lock_logs_conn!(db.logs_conn);
-            if let Err(e) = Self::incremental_vacuum_on_conn(&logs_conn) {
-                log::warn!("Startup log database incremental vacuum failed: {e}");
-            }
-        }
+        // Log rollup/pruning and vacuum (of both the config and the log database)
+        // run in periodic_backup_if_needed after startup recovery, on a blocking
+        // worker. Doing them here holds up the main window and repeats the same
+        // maintenance during startup.
 
         Ok(db)
     }
